@@ -184,7 +184,6 @@ def load_settings():
                 if "min_strike_distance_bp" in strat: base_settings.MIN_STRIKE_DISTANCE_BP = float(strat["min_strike_distance_bp"])
                 if "min_entry_second" in strat: base_settings.MIN_ENTRY_SECOND = int(strat["min_entry_second"])
                 if "max_entry_second" in strat: base_settings.MAX_ENTRY_SECOND = int(strat["max_entry_second"])
-                if "use_15m_ha" in strat: base_settings.USE_15M_HA = bool(strat["use_15m_ha"])
                 if "circuit_breaker_losses" in strat: base_settings.CIRCUIT_BREAKER_LOSSES = int(strat["circuit_breaker_losses"])
                 if "pause_markets" in strat:
                     base_settings.PAUSE_MARKETS = int(strat["pause_markets"])

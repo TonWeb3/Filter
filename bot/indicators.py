@@ -18,7 +18,7 @@ def compute_rsi(closes: List[float], period: int) -> Optional[float]:
 
 
 def compute_heiken_ashi(candles: List[Dict]) -> List[Dict]:
-    """Heiken-Ashi candles. Used (via count_consecutive) for the exhaustion veto."""
+    """Heiken-Ashi candles calculation (used for 15m structural trend alignment)."""
     if not candles:
         return []
 

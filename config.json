@@ -46,7 +46,6 @@
     "min_strike_distance_bp": 6.0,
     "min_entry_second": 90,
     "max_entry_second": 600,
-    "use_15m_ha": true,
     "circuit_breaker_losses": 2,
     "pause_markets": 4,
     "max_1h_vol_bp": 45.0,

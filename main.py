@@ -1011,7 +1011,6 @@ async def evaluate_entry(reason: str = "event"):
             "spotPrice": spot_price,
             "strikePrice": ctx.get("strike_open"),
             "minStrikeDistanceBp": settings.MIN_STRIKE_DISTANCE_BP,
-            "use15mHa": settings.USE_15M_HA,
             "haFlatBottom": ctx.get("ha_15m_flat_bottom", False),
             "haFlatTop": ctx.get("ha_15m_flat_top", False),
         })
@@ -1170,14 +1169,6 @@ async def update_loop():
 
             time_left_min = (settlement_ms - time.time() * 1000) / 60_000 if settlement_ms else timing["remainingMinutes"]
 
-            closes = [c["close"] for c in klines_1m]
-            rsi_now = indicators.compute_rsi(closes, settings.RSI_PERIOD)
-
-            consec = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_1m))
-            consec_5m = {"color": None, "count": 0}
-            if len(klines_5m) >= 20:
-                consec_5m = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_5m))
-
             market_up = poly_snapshot["prices"]["up"] if poly_snapshot["ok"] else None
             market_down = poly_snapshot["prices"]["down"] if poly_snapshot["ok"] else None
 
@@ -1202,7 +1193,6 @@ async def update_loop():
                 "spotPrice": spot_price,
                 "strikePrice": strike_open,
                 "minStrikeDistanceBp": settings.MIN_STRIKE_DISTANCE_BP,
-                "use15mHa": settings.USE_15M_HA,
                 "haFlatBottom": ha_15m.get("flat_bottom", False),
                 "haFlatTop": ha_15m.get("flat_top", False),
             })
@@ -1222,7 +1212,6 @@ async def update_loop():
                     "vol_1h_bp": vol_1h_bp,
                     "ha_15m_flat_bottom": ha_15m.get("flat_bottom", False),
                     "ha_15m_flat_top": ha_15m.get("flat_top", False),
-                    "rsi": rsi_now,
                     "prices": poly_snapshot["prices"],
                     "token_ids": poly_snapshot["token_ids"],
                     "orderbook": poly_snapshot.get("orderbook", {}),
@@ -1346,9 +1335,6 @@ async def update_loop():
                     "book_source": poly_snapshot.get("book_source") if poly_snapshot.get("ok") else None
                 },
                 "indicators": {
-                    "rsi": rsi_now,
-                    "heiken": consec,
-                    "heiken_5m": consec_5m,
                     "ha_15m": ha_15m,
                     "vol_1h_bp": vol_1h_bp,
                     "fair": fair_data
@@ -1530,7 +1516,6 @@ async def get_settings():
             "min_strike_distance_bp": settings.MIN_STRIKE_DISTANCE_BP,
             "min_entry_second": settings.MIN_ENTRY_SECOND,
             "max_entry_second": settings.MAX_ENTRY_SECOND,
-            "use_15m_ha": settings.USE_15M_HA,
             "circuit_breaker_losses": settings.CIRCUIT_BREAKER_LOSSES,
             "pause_markets": settings.PAUSE_MARKETS,
             "max_1h_vol_bp": settings.MAX_1H_VOL_BP,
@@ -1622,7 +1607,6 @@ async def post_settings(new_settings: Dict[str, Any]):
         if "min_strike_distance_bp" in st: settings.MIN_STRIKE_DISTANCE_BP = float(st["min_strike_distance_bp"])
         if "min_entry_second" in st: settings.MIN_ENTRY_SECOND = int(st["min_entry_second"])
         if "max_entry_second" in st: settings.MAX_ENTRY_SECOND = int(st["max_entry_second"])
-        if "use_15m_ha" in st: settings.USE_15M_HA = bool(st["use_15m_ha"])
         if "circuit_breaker_losses" in st: settings.CIRCUIT_BREAKER_LOSSES = int(st["circuit_breaker_losses"])
         if "pause_markets" in st:
             settings.PAUSE_MARKETS = int(st["pause_markets"])

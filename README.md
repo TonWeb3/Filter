@@ -15,7 +15,7 @@ The bot utilizes the Stage 7 quantitative engine, combining latency arbitrage wi
 - **Expected Value (EV) Gate (`ev_threshold: 0.04`)**: Requires at least a **4¢ net edge** ($\text{fair prob} - \text{market ask} \ge 0.04$) before placing orders.
 - **Directional Floor (`min_prob: 0.55`)**: Forbids 50/50 coin-flip entries even if EV appears slightly positive.
 - **Strike Moneyness Lead (`min_strike_distance_bp: 6.0`)**: Requires Bitcoin spot to have moved at least **6.0 basis points** ($\approx \$60$ on BTC) away from the market opening strike in the bet direction, completely eliminating the hostile 50/50 chop noise zone.
-- **15m Structural Heiken-Ashi (`use_15m_ha: true`)**: Analyzes the active 15m Heiken-Ashi candle. Automatically blocks counter-trend DOWN bets during flat-bottom green expansion candles (institutional bull trends) and blocks UP bets during flat-top red candles (institutional bear trends).
+- **15m Structural Heiken-Ashi Alignment**: Built-in institutional trend rule. Analyzes the active 15m Heiken-Ashi candle to block counter-trend DOWN bets during flat-bottom green expansion candles (institutional bull trends) and block UP bets during flat-top red candles (institutional bear trends).
 - **Micro-Vetoes OFF**: 1m RSI and 1m/5m Heiken-Ashi exhaustion streak vetoes are **completely bypassed**. Backtesting demonstrated that micro-vetoes prematurely halted strong 15m trend continuations that held a $69.5\%$ win rate.
 
 ### 2. Drawdown Defense Architecture
@@ -73,7 +73,6 @@ All parameters are centrally managed in `config.json` and editable live in the d
     "min_strike_distance_bp": 6.0,
     "min_entry_second": 90,
     "max_entry_second": 600,
-    "use_15m_ha": true,
     "circuit_breaker_losses": 2,
     "pause_markets": 4,
     "max_1h_vol_bp": 45.0,

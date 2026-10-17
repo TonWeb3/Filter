@@ -198,13 +198,9 @@
                 <h3 class="text-lg sm:text-xl font-bold mb-4 border-b border-gray-700 pb-2">Technical Indicators</h3>
                 <div class="space-y-4">
                     <div class="flex justify-between text-sm sm:text-base">
-                        <span class="text-gray-400">RSI (14) <span class="text-[10px] text-gray-500">(Informational — Veto OFF)</span></span>
-                        <span :class="data.indicators?.rsi > 70 ? 'text-red-400' : (data.indicators?.rsi < 30 ? 'text-green-400' : 'text-white')" x-text="data.indicators?.rsi != null ? data.indicators.rsi.toFixed(2) : '--'"></span>
-                    </div>
-                    <div class="flex justify-between text-sm sm:text-base">
-                        <span class="text-gray-400">Heiken Ashi (1m) <span class="text-[10px] text-gray-500">(Informational)</span></span>
-                        <span :class="data.indicators?.heiken?.color === 'green' ? 'text-green-400' : (data.indicators?.heiken?.color === 'red' ? 'text-red-400' : 'text-gray-500')"
-                              x-text="data.indicators?.heiken?.count != null ? (data.indicators?.heiken?.color + ' x' + data.indicators?.heiken?.count) : '--'"></span>
+                        <span class="text-gray-400">1h Realized Vol (ATR)</span>
+                        <span :class="(data.indicators?.vol_1h_bp || 0) > 45 ? 'text-red-400 font-semibold' : 'text-gray-300'"
+                              x-text="data.indicators?.vol_1h_bp != null ? (data.indicators.vol_1h_bp.toFixed(1) + ' bp') : '--'"></span>
                     </div>
                     <div class="flex justify-between text-sm sm:text-base">
                         <span class="text-gray-400">15m HA Trend Alignment</span>

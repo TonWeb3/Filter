@@ -57,12 +57,11 @@ def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
             return _no_ev(f"moneyness_down_{move_bp:.1f}bp_gt_{-min_strike_bp:.1f}bp")
 
     # ── STAGE 7 ALPHA 2: 15m Structural Heiken-Ashi Alignment ────────────────
-    # Forbids DOWN bets on flat-bottom green candles; forbids UP bets on flat-top red candles
-    if inputs.get("use15mHa", True):
-        if side == "DOWN" and inputs.get("haFlatBottom"):
-            return _no_ev("ha_15m_flat_bottom_bullish_block")
-        if side == "UP" and inputs.get("haFlatTop"):
-            return _no_ev("ha_15m_flat_top_bearish_block")
+    # Core strategy rule: blocks counter-trend bets against institutional expansion candles
+    if side == "DOWN" and inputs.get("haFlatBottom"):
+        return _no_ev("ha_15m_flat_bottom_bullish_block")
+    if side == "UP" and inputs.get("haFlatTop"):
+        return _no_ev("ha_15m_flat_top_bearish_block")
 
     # ── Mathematical Probability & EV Gates ──────────────────────────────────
     if p < min_prob:
