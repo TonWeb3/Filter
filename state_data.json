@@ -1,0 +1,8 @@
+{
+  "paper_balance": 1000.0,
+  "active_trades": [],
+  "trade_history": [],
+  "last_trade_side": null,
+  "consecutive_losses": 0,
+  "cb_pause_until_ms": 0
+}
