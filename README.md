@@ -1,12 +1,12 @@
 # Polymarket BTC 15m Assistant (Python FastAPI)
 
-A real-time, high-performance automated trading assistant for Polymarket **"Bitcoin Up or Down" 15-minute** binary options markets, powered by FastAPI and the **Stage 7 (Overall Champion) 🏆** quantitative strategy.
+A real-time, high-performance automated trading assistant for Polymarket **"Bitcoin Up or Down" 15-minute** binary options markets, powered by FastAPI and the **Stage 7: Circuit Breaker + Volatility Gate (<45 bp) + Skip 18 & 23 UTC (Vetoes OFF) 🏆** quantitative strategy.
 
-> **📖 Empirical Backtest Reference:** Tested and validated on historical 15m Polymarket BTC markets in `Scripts/FILTERS_REPORT.md` and `Scripts/results/optimization_report.md` (Net Profit: **+$214,357.25**, Win Rate: **77.2%**, Profit Factor: **2.60**).
+> **📖 Empirical Backtest Reference:** Ranked **#1 Overall Champion** across 24 simulated strategy configurations on 2,880 historical 15m Polymarket BTC markets in `Scripts/results/optimization_report.md` (Net Profit: **+$471,070.12**, Win Rate: **87.01%**, Profit Factor: **1.73**, Max Drawdown: **-29.44%**, Total Trades: **639**).
 
 ---
 
-## 🏆 Stage 7 (Overall Champion) Strategy
+## 🏆 Stage 7: Circuit Breaker + Volatility Gate (<45 bp) + Skip 18 & 23 UTC (Vetoes OFF)
 
 The bot utilizes the Stage 7 quantitative engine, combining latency arbitrage with structural trend filters and systematic drawdown defense:
 

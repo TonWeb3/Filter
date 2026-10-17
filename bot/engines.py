@@ -1,9 +1,9 @@
 from typing import Dict, Any
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Stage 7 (Champion Strategy) Entry Engine
+#  Stage 7: CB + Vol (<45 bp) + Skip 18 & 23 UTC (Vetoes OFF) Entry Engine
 #
-#  Optimized quantitative binary options model for Polymarket 15m markets:
+#  Optimized quantitative binary options model for Polymarket 15m markets (#1 Champion):
 #    1. Fast GBM Fair Probability vs Polymarket CLOB ask price (EV gate >= 0.04)
 #    2. Strike Moneyness Margin of Safety: minimum 6.0 bp lead from strike price
 #       eliminates the 50/50 chop noise zone.
@@ -18,9 +18,10 @@ def _no_ev(reason: str) -> Dict[str, Any]:
 
 
 def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    """Stage 7 Entry Engine: Fair probability vs market ask price, gated by
-    Moneyness margin of safety and 15m structural Heiken-Ashi alignment.
-    Micro-vetoes are completely bypassed as per the champion optimization report.
+    """Stage 7 Entry Engine: CB + Vol (<45 bp) + Skip 18 & 23 UTC (Vetoes OFF).
+    Fair probability vs market ask price, gated by Moneyness margin of safety (6.0 bp)
+    and 15m structural Heiken-Ashi alignment. Micro-vetoes are completely bypassed
+    as per the champion optimization report (+$471,070.12 net profit, 87.01% WR).
     """
     p_up = inputs.get("mcProbUp")
     price_up = inputs.get("priceUp")     # ask (buy) price for the UP share, 0..1
