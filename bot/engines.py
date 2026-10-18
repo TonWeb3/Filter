@@ -49,8 +49,8 @@ def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
     spot = inputs.get("spotPrice")
     strike = inputs.get("strikePrice")
     min_strike_bp = inputs.get("minStrikeDistanceBp", 6.0)
+    move_bp = (spot - strike) / strike * 10000.0 if (spot and strike and strike > 0) else 0.0
     if min_strike_bp > 0 and spot and strike and strike > 0:
-        move_bp = (spot - strike) / strike * 10000.0
         if side == "UP" and move_bp < min_strike_bp:
             return _no_ev(f"moneyness_up_{move_bp:.1f}bp_lt_{min_strike_bp:.1f}bp")
         if side == "DOWN" and move_bp > -min_strike_bp:
@@ -72,5 +72,6 @@ def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
     strength = "HIGH_CONVICTION" if p >= 0.70 else "STRONG"
     return {
         "action": "ENTER", "side": side, "phase": "STAGE7", "strength": strength,
-        "prob": p, "price": price, "ev": ev, "reason": "stage7_ev_enter"
+        "prob": p, "price": price, "ev": ev, "move_bp": round(move_bp, 2),
+        "reason": "stage7_ev_enter"
     }

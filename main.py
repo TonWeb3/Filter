@@ -1002,6 +1002,7 @@ async def evaluate_entry(reason: str = "event"):
         if down_ws_sum and down_ws_sum.get("bestAsk"):
             market_down = down_ws_sum["bestAsk"]
 
+        eval_open = ctx.get("target_open") or ctx.get("strike_open")
         decision = engines.decide_ev({
             "mcProbUp": fair_up,
             "priceUp": market_up,
@@ -1009,7 +1010,7 @@ async def evaluate_entry(reason: str = "event"):
             "minProb": settings.MIN_PROB_EV,
             "evThreshold": settings.EV_THRESHOLD,
             "spotPrice": spot_price,
-            "strikePrice": ctx.get("strike_open"),
+            "strikePrice": eval_open,
             "minStrikeDistanceBp": settings.MIN_STRIKE_DISTANCE_BP,
             "haFlatBottom": ctx.get("ha_15m_flat_bottom", False),
             "haFlatTop": ctx.get("ha_15m_flat_top", False),
@@ -1151,7 +1152,7 @@ async def update_loop():
                 if c["openTime"] < start_ms:
                     break
             model_open = model_open or win.get("binance")
-            target_open = model_open if strike_open is not None else None
+            target_open = model_open or strike_open
 
             drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
             fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
@@ -1184,6 +1185,7 @@ async def update_loop():
             prob_view = {"adjustedUp": fair_up, "adjustedDown": 1 - fair_up}
 
             # Stage 7 Champion Decision Engine (Micro-vetoes removed)
+            eval_open = target_open or strike_open
             decision = engines.decide_ev({
                 "mcProbUp": fair_up,
                 "priceUp": market_up,
@@ -1191,7 +1193,7 @@ async def update_loop():
                 "minProb": settings.MIN_PROB_EV,
                 "evThreshold": settings.EV_THRESHOLD,
                 "spotPrice": spot_price,
-                "strikePrice": strike_open,
+                "strikePrice": eval_open,
                 "minStrikeDistanceBp": settings.MIN_STRIKE_DISTANCE_BP,
                 "haFlatBottom": ha_15m.get("flat_bottom", False),
                 "haFlatTop": ha_15m.get("flat_top", False),
@@ -1317,7 +1319,7 @@ async def update_loop():
                     "min_entry_second": settings.MIN_ENTRY_SECOND,
                     "max_entry_second": settings.MAX_ENTRY_SECOND,
                     "min_strike_distance_bp": settings.MIN_STRIKE_DISTANCE_BP,
-                    "spot_vs_strike_bp": round(((spot_price - strike_open) / strike_open * 10000.0), 1) if (spot_price and strike_open and strike_open > 0) else None,
+                    "spot_vs_strike_bp": round(((spot_price - eval_open) / eval_open * 10000.0), 1) if (spot_price and eval_open and eval_open > 0) else None,
                     "ha_15m_flat_bottom": ha_15m.get("flat_bottom", False),
                     "ha_15m_flat_top": ha_15m.get("flat_top", False),
                 },
