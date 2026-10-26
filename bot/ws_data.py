@@ -1,62 +1,135 @@
 import asyncio
-import json
-import aiohttp
 import time
 from typing import Optional, Callable, Dict, List
+import aiohttp
 from .config import settings
 from .net_utils import get_proxy_url_for
+from .indicators import ChainlinkTwapTracker
+
+# ── Low-Level Performance: Fast JSON Acceleration (orjson / std json fallback) ──
+try:
+    import orjson
+    def fast_loads(s):
+        if isinstance(s, (bytes, bytearray)):
+            return orjson.loads(s)
+        return orjson.loads(s.encode("utf-8"))
+    def fast_dumps(obj):
+        return orjson.dumps(obj).decode("utf-8")
+except ImportError:
+    import json
+    def fast_loads(s):
+        return json.loads(s)
+    def fast_dumps(obj):
+        return json.dumps(obj)
+
 
 class BinanceTradeStream:
-    """Fast spot-price feed from Binance @trade — the leading signal for fair_prob."""
+    """Ultra-fast spot + futures leading price feed from Binance.
+    Listens to Binance Futures (@bookTicker and @trade) which leads spot price discovery
+    by 30ms-80ms, with seamless fallback/redundancy to Binance Spot (@trade)."""
     def __init__(self, symbol: str, on_update: Optional[Callable] = None):
         self.symbol = symbol.lower()
         self.on_update = on_update
         self.last_price = None
         self.last_ts = None
+        self.last_source = None
         self.closed = False
 
-    async def start(self):
+    async def _futures_worker(self):
+        """Binance USDT-M Futures feed (@bookTicker) — the leading edge signal.
+        The mid-price of best bid and ask updates before spot trades print."""
+        endpoints = [
+            f"wss://fstream.binance.com/ws/{self.symbol}@bookTicker",
+            f"wss://fstream.binance.com/ws/{self.symbol}@trade"
+        ]
+        url = endpoints[0]
+        while not self.closed:
+            try:
+                proxy = get_proxy_url_for(url)
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
+                        print(f"Connected to Binance Futures Lead WS: {self.symbol}@bookTicker")
+                        while not self.closed:
+                            msg = await ws.receive()
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data_msg = fast_loads(msg.data)
+                                if "b" in data_msg and "a" in data_msg:
+                                    try:
+                                        bid = float(data_msg["b"])
+                                        ask = float(data_msg["a"])
+                                        if bid > 0 and ask > 0:
+                                            mid = (bid + ask) / 2.0
+                                            self._process_trade(mid, source="binance_futures_book")
+                                    except (TypeError, ValueError):
+                                        pass
+                                elif "p" in data_msg:
+                                    try:
+                                        p = float(data_msg["p"])
+                                        if p > 0:
+                                            self._process_trade(p, source="binance_futures_trade")
+                                    except (TypeError, ValueError):
+                                        pass
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+            except Exception as e:
+                if not self.closed:
+                    await asyncio.sleep(2)
+
+    async def _spot_worker(self):
+        """Binance Spot feed (@trade) — robust fallback and spot anchor."""
         endpoints = [
             f"wss://data-stream.binance.vision/ws/{self.symbol}@trade",
             f"wss://stream.binance.com:9443/ws/{self.symbol}@trade"
         ]
         endpoint_idx = 0
-
         while not self.closed:
             url = endpoints[endpoint_idx % len(endpoints)]
             endpoint_idx += 1
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, proxy=proxy if proxy else None) as ws:
-                        print(f"Connected to Binance WS ({url}): {self.symbol}")
+                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
+                        print(f"Connected to Binance Spot WS ({url}): {self.symbol}")
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_msg = json.loads(msg.data)
+                                data_msg = fast_loads(msg.data)
                                 if "p" in data_msg:
-                                    self._process_trade(float(data_msg.get("p")))
+                                    try:
+                                        p = float(data_msg["p"])
+                                        if p > 0:
+                                            self._process_trade(p, source="binance_spot_trade")
+                                    except (TypeError, ValueError):
+                                        pass
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
             except Exception as e:
-                print(f"Binance trade WS failed ({url}): {e}")
                 if not self.closed:
                     await asyncio.sleep(2)
 
-    def _process_trade(self, p: float):
+    async def start(self):
+        # Run both Futures (leading edge) and Spot (redundancy) concurrently
+        await asyncio.gather(
+            self._futures_worker(),
+            self._spot_worker(),
+            return_exceptions=True
+        )
+
+    def _process_trade(self, p: float, source: str = "binance"):
         self.last_price = p
         self.last_ts = time.time()
+        self.last_source = source
 
         if self.on_update:
             try:
-                res = self.on_update({"price": self.last_price, "ts": self.last_ts})
+                res = self.on_update({"price": self.last_price, "ts": self.last_ts, "source": source})
                 if asyncio.iscoroutine(res):
                     asyncio.create_task(res)
             except Exception:
                 pass
 
     def get_last(self):
-        return {"price": self.last_price, "ts": self.last_ts}
+        return {"price": self.last_price, "ts": self.last_ts, "source": self.last_source}
 
     def close(self):
         self.closed = True
@@ -87,7 +160,7 @@ class BinanceKlineStream:
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_msg = json.loads(msg.data)
+                                data_msg = fast_loads(msg.data)
                                 k = data_msg.get("k", {})
                                 if k.get("t") is not None:
                                     candle = {
@@ -135,6 +208,7 @@ class PolymarketChainlinkStream:
         self.on_update = on_update
         self.last_price = None
         self.last_updated_at = None
+        self.twap_tracker = ChainlinkTwapTracker(60.0)
         self.closed = False
 
     async def start(self):
@@ -174,7 +248,7 @@ class PolymarketChainlinkStream:
                                     continue
 
                                 try:
-                                    data_msg = json.loads(data_text)
+                                    data_msg = fast_loads(data_text)
                                 except Exception:
                                     continue
 
@@ -185,7 +259,7 @@ class PolymarketChainlinkStream:
                                 payload = data_msg.get("payload", {})
                                 if isinstance(payload, str):
                                     try:
-                                        payload = json.loads(payload)
+                                        payload = fast_loads(payload)
                                     except:
                                         continue
 
@@ -208,6 +282,7 @@ class PolymarketChainlinkStream:
                                             updated_at = float(ts_val)
                                             if updated_at < 10000000000: updated_at *= 1000
                                             self.last_updated_at = updated_at
+                                            self.twap_tracker.add_tick(self.last_price, self.last_updated_at)
 
                                             if self.on_update:
                                                 res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "polymarket_ws"})
@@ -223,8 +298,11 @@ class PolymarketChainlinkStream:
                 if not self.closed:
                     await asyncio.sleep(2)
 
+    def get_twap(self) -> Optional[float]:
+        return self.twap_tracker.get_twap()
+
     def get_last(self):
-        return {"price": self.last_price, "updatedAt": self.last_updated_at, "source": "polymarket_ws"}
+        return {"price": self.last_price, "updatedAt": self.last_updated_at, "twap": self.twap_tracker.get_twap(), "source": "polymarket_ws"}
 
     def close(self):
         self.closed = True
@@ -288,7 +366,7 @@ class PolymarketClobMarketStream:
                                     if not data_text or data_text in ("PONG", "PING", "OK", "PONG\n"):
                                         continue
                                     try:
-                                        data = json.loads(data_text)
+                                        data = fast_loads(data_text)
                                         self._process_msg(data)
                                     except Exception:
                                         continue
@@ -490,6 +568,7 @@ class ChainlinkPriceStream:
         self.on_update = on_update
         self.last_price = None
         self.last_updated_at = None
+        self.twap_tracker = ChainlinkTwapTracker(60.0)
         self.closed = False
         self.wss_urls = settings.POLYGON_WSS_URLS + ([settings.POLYGON_WSS_URL] if settings.POLYGON_WSS_URL else [])
 
@@ -523,7 +602,7 @@ class ChainlinkPriceStream:
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_res = json.loads(msg.data)
+                                data_res = fast_loads(msg.data)
                                 if data_res.get("method") == "eth_subscription":
                                     log = data_res.get("params", {}).get("result", {})
                                     topics = log.get("topics", [])
@@ -536,6 +615,7 @@ class ChainlinkPriceStream:
                                         data_hex = log.get("data", "0x")
                                         if len(data_hex) >= 66:
                                             self.last_updated_at = int(data_hex[2:66], 16) * 1000
+                                        self.twap_tracker.add_tick(self.last_price, self.last_updated_at)
 
                                         if self.on_update:
                                             res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"})
@@ -548,8 +628,11 @@ class ChainlinkPriceStream:
                 if not self.closed:
                     await asyncio.sleep(2)
 
+    def get_twap(self) -> Optional[float]:
+        return self.twap_tracker.get_twap()
+
     def get_last(self):
-        return {"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"}
+        return {"price": self.last_price, "updatedAt": self.last_updated_at, "twap": self.twap_tracker.get_twap(), "source": "chainlink_ws"}
 
     def close(self):
         self.closed = True

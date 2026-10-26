@@ -17,11 +17,15 @@ class Settings(BaseSettings):
     # The wallet is DERIVED from PRIVATE_KEY (hex key or 12/24-word seed phrase) and
     # auto-detected: deposit-wallet (V2, signature_type 3) first, then legacy proxy /
     # safe — whichever actually holds pUSD. Nothing to pick by hand.
-    CLOB_MAX_SLIPPAGE: float = 0.02  # marketable-limit buffer above the quote (probability units)
+    CLOB_MAX_SLIPPAGE: float = 0.05  # marketable-limit buffer above the quote (probability units)
     EXIT_MAX_RETRIES: int = 3
     CLOB_ALLOW_PARTIAL_FILL: bool = True  # FOK with FAK fallback for thin books
     RELAYER_API_KEY: str = ""        # Polymarket relayer API key (sponsors gasless on-chain setup)
     ALCHEMY_API_KEY: str = ""        # optional: dedicated Polygon RPC for chain reads
+
+    # ── Copy-trader continuous FOK execution ───────────────────────────────────
+    COPY_RETRY_INTERVAL_MS: int = 300
+    COPY_MIN_REMAINING_S: float = 30.0
 
     SYMBOL: str = "BTCUSDT"
     BINANCE_BASE_URL: str = "https://api.binance.com"
@@ -147,15 +151,24 @@ def load_settings():
             if "private_key" in config_data:
                 base_settings.PRIVATE_KEY = normalize_private_key(config_data["private_key"])
 
-            if "relayer" in config_data:
-                rl = config_data["relayer"]
-                if "api_key" in rl: base_settings.RELAYER_API_KEY = rl["api_key"]
-
             if "live" in config_data:
                 live = config_data["live"]
                 if "max_slippage" in live: base_settings.CLOB_MAX_SLIPPAGE = float(live["max_slippage"])
                 if "exit_max_retries" in live: base_settings.EXIT_MAX_RETRIES = int(live["exit_max_retries"])
                 if "allow_partial_fill" in live: base_settings.CLOB_ALLOW_PARTIAL_FILL = bool(live["allow_partial_fill"])
+                if "copy_trader" in live:
+                    ct = live["copy_trader"]
+                    if "retry_interval_ms" in ct: base_settings.COPY_RETRY_INTERVAL_MS = int(ct["retry_interval_ms"])
+                    if "min_remaining_seconds" in ct: base_settings.COPY_MIN_REMAINING_S = float(ct["min_remaining_seconds"])
+
+            if "relayer" in config_data:
+                rl = config_data["relayer"]
+                if "api_key" in rl: base_settings.RELAYER_API_KEY = rl["api_key"]
+
+            if "copy_trader" in config_data and "copy_trader" not in config_data.get("live", {}):
+                ct = config_data["copy_trader"]
+                if "retry_interval_ms" in ct: base_settings.COPY_RETRY_INTERVAL_MS = int(ct["retry_interval_ms"])
+                if "min_remaining_seconds" in ct: base_settings.COPY_MIN_REMAINING_S = float(ct["min_remaining_seconds"])
 
             if "polymarket" in config_data:
                 poly = config_data["polymarket"]

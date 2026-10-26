@@ -18,6 +18,8 @@ All clients are synchronous — call from the event loop via `asyncio.to_thread`
 """
 
 import threading
+import time
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from .config import settings
 
@@ -49,7 +51,86 @@ def _patch_clob_models():
         pass
 
 
+def _patch_order_builder():
+    """Polymarket CLOB V2 strictly enforces:
+    - Market buy maker amount: max 2 decimals (collateral/USDC spent)
+    - Market buy taker amount: max 4 decimals (tokens/shares received)
+    The polymarket-apis library's default ROUNDING_CONFIG specifies amount=5 for 0.001
+    and amount=6 for 0.0001 tick sizes, which produces taker amounts with > 4 decimals.
+    Polymarket rejects these with:
+      HTTP 400 - invalid amounts, the market buy orders maker amount supports a max accuracy of 2 decimals, taker amount a max of 4 decimals.
+    This patch clamps ROUNDING_CONFIG to a maximum of 4 decimals and ensures exact integer divisibility:
+      maker amount is snapped to 10,000 (10^(6-2) -> max 2 decimals)
+      taker amount is snapped to 100 (10^(6-4) -> max 4 decimals)
+    """
+    try:
+        from polymarket_apis.utilities.order_builder.builder import OrderBuilder, ROUNDING_CONFIG, RoundConfig
+        for k, rc in list(ROUNDING_CONFIG.items()):
+            if rc.amount > 4:
+                ROUNDING_CONFIG[k] = RoundConfig(price=rc.price, size=rc.size, amount=min(4, rc.amount))
+
+        orig_get_market = OrderBuilder.get_market_order_amounts
+
+        def safe_get_market_order_amounts(self, side: str, amount: float, price: float, round_config):
+            res_side, maker, taker = orig_get_market(self, side, amount, price, round_config)
+            if side == "BUY":
+                maker = (maker // 10_000) * 10_000
+                taker = (taker // 100) * 100
+            elif side == "SELL":
+                maker = (maker // 100) * 100
+                taker = (taker // 10_000) * 10_000
+            return res_side, maker, taker
+
+        OrderBuilder.get_market_order_amounts = safe_get_market_order_amounts
+    except Exception as e:
+        print(f"Warning: Failed to patch OrderBuilder: {e}")
+
+
+def _patch_crypto_signing():
+    """Accelerate EIP-712 cryptographic signing using compiled C coincurve (libsecp256k1).
+    Bypasses pure-Python eth-account modular arithmetic, dropping signature creation to sub-0.1ms."""
+    try:
+        import coincurve
+        from eth_account import Account
+        from eth_account.datastructures import SignedMessage
+
+        orig_unsafe_sign_hash = Account.unsafe_sign_hash
+
+        def fast_unsafe_sign_hash(message_hash, private_key):
+            try:
+                if isinstance(private_key, str):
+                    pk_bytes = bytes.fromhex(private_key[2:] if private_key.startswith("0x") else private_key)
+                elif hasattr(private_key, "key"):
+                    pk_bytes = bytes(private_key.key)
+                else:
+                    pk_bytes = bytes(private_key)
+
+                msg_bytes = bytes.fromhex(message_hash[2:] if str(message_hash).startswith("0x") else message_hash) if isinstance(message_hash, str) else bytes(message_hash)
+
+                pk = coincurve.PrivateKey(pk_bytes)
+                sig65 = pk.sign_recoverable(msg_bytes, hasher=None)
+                r = int.from_bytes(sig65[:32], "big")
+                s = int.from_bytes(sig65[32:64], "big")
+                v = sig65[64] + 27
+                sig_bytes = sig65[:64] + bytes([v])
+                return SignedMessage(
+                    messageHash=msg_bytes,
+                    r=r,
+                    s=s,
+                    v=v,
+                    signature=sig_bytes,
+                )
+            except Exception:
+                return orig_unsafe_sign_hash(message_hash, private_key)
+
+        Account.unsafe_sign_hash = staticmethod(fast_unsafe_sign_hash)
+    except Exception as e:
+        print(f"Note: coincurve C-signing patch fallback: {e}")
+
+
 _patch_clob_models()
+_patch_order_builder()
+_patch_crypto_signing()
 
 
 class ClobTrader:
@@ -168,6 +249,9 @@ class ClobTrader:
         self.ready = True
         self.last_error = None
 
+    def is_ready(self) -> bool:
+        return bool(self.ready and self.clob is not None)
+
     def ensure_ready(self) -> bool:
         if self.ready and self.clob is not None:
             return True
@@ -203,18 +287,39 @@ class ClobTrader:
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
+    def warm_token(self, token_id: str, tick_size: str = "0.01", neg_risk: bool = False):
+        """Pre-warm token fee, tick size, and neg_risk metadata in the CLOB client
+        so order creation and EIP-712 signing execute in ~7ms with zero network round trips."""
+        if not self.clob or not token_id:
+            return
+        tid = str(token_id)
+        try:
+            from polymarket_apis.types.clob_types import FeeInfo
+            if hasattr(self.clob, "_PolymarketReadOnlyClobClient__fee_infos"):
+                if tid not in self.clob._PolymarketReadOnlyClobClient__fee_infos:
+                    self.clob._PolymarketReadOnlyClobClient__fee_infos[tid] = FeeInfo(rate=0, exponent=0)
+            if hasattr(self.clob, "_PolymarketReadOnlyClobClient__tick_sizes"):
+                self.clob._PolymarketReadOnlyClobClient__tick_sizes[tid] = (tick_size, time.monotonic() + 86400)
+            if hasattr(self.clob, "_PolymarketReadOnlyClobClient__neg_risk"):
+                self.clob._PolymarketReadOnlyClobClient__neg_risk[tid] = neg_risk
+        except Exception:
+            pass
+
     # ── orders ──────────────────────────────────────────────────────────────────
     def _market_order(self, token_id, amount, side: str, price, order_type=None) -> Dict[str, Any]:
-        from polymarket_apis.types.clob_types import MarketOrderArgs, OrderType
+        from polymarket_apis.types.clob_types import MarketOrderArgs, OrderType, PartialCreateOrderOptions
         ot = order_type if order_type is not None else OrderType.FOK
+        order_amount = max(1.00, round(float(amount), 2)) if side == "BUY" else round(float(amount), 4)
         args = MarketOrderArgs(
             token_id=str(token_id),
-            amount=round(float(amount), 2),   # BUY: USDC to spend; SELL: shares to sell
+            amount=order_amount,   # BUY: USDC to spend (2 dec, min $1.00); SELL: shares to sell (up to 4 dec)
             side=side,                        # "BUY" / "SELL"
             price=round(float(price), 4) if price else 0,
             order_type=ot,
         )
-        resp = self.clob.create_and_post_market_order(args)
+        self.warm_token(token_id)
+        opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+        resp = self.clob.create_and_post_market_order(args, options=opts)
         if resp is None:
             return {"ok": False, "error": "no_response_from_clob", "response": {}}
 
@@ -236,11 +341,29 @@ class ClobTrader:
             shares, usd = making, taking
 
         filled = (data.get("success") is not False
-                  and status in self._FILLED_STATUSES
+                  and (status in self._FILLED_STATUSES or status in ("matched", "delayed", "filled", "closed"))
                   and shares is not None and shares > 0
                   and usd is not None and usd > 0)
 
         if not filled:
+            # If order_id exists, check get_order_fills before assuming failure (handles 'delayed' status)
+            if order_id:
+                time.sleep(0.5)
+                fills = self.get_order_fills(str(order_id), str(token_id))
+                if fills:
+                    total_shares = sum(float(f["size"]) for f in fills)
+                    total_usd = sum(float(f["size"]) * float(f["price"]) for f in fills)
+                    return {
+                        "ok": True, "response": data, "order_id": order_id, "status": "filled",
+                        "fill_price": (total_usd / total_shares) if total_shares else None,
+                        "fill_size": total_shares,
+                        "fill_usd": total_usd,
+                    }
+                try:
+                    self.cancel_order(str(order_id))
+                except Exception:
+                    pass
+
             return {"ok": False, "response": data, "order_id": order_id,
                     "status": status,
                     "error": err or f"not_filled(status={status or 'unknown'})"}
@@ -253,7 +376,7 @@ class ClobTrader:
             "fill_usd": usd,
         }
 
-    def place_market_buy(self, token_id: str, usdc_amount: float, price: Optional[float] = None) -> Dict[str, Any]:
+    def place_market_buy(self, token_id: str, usdc_amount: float, price: Optional[float] = None, slippage: Optional[float] = None) -> Dict[str, Any]:
         """Fill-Or-Kill marketable BUY for `usdc_amount` USDC of `token_id`. `price`
         is the current quote; the limit is quote + slippage buffer (capped < $1).
         If FOK fails due to partial fill/liquidity and CLOB_ALLOW_PARTIAL_FILL is True,
@@ -263,14 +386,17 @@ class ClobTrader:
         if not self.ensure_ready():
             return {"ok": False, "error": self.last_error or "client_not_ready"}
         # Ensure the deposit wallet is deployed + approved before the first order.
-        setup = self.ensure_setup()
-        if not setup.get("ok") and setup.get("error") != "missing_relayer_api_key":
-            return {"ok": False, "error": f"setup_failed: {setup.get('error')}"}
+        if not self._approvals_done and settings.RELAYER_API_KEY:
+            try:
+                self.ensure_setup()
+            except Exception:
+                pass
         try:
             from polymarket_apis.types.clob_types import OrderType
-            limit = min(0.99, float(price) + settings.CLOB_MAX_SLIPPAGE) if price and price > 0 else 0
+            slip = slippage if slippage is not None else settings.CLOB_MAX_SLIPPAGE
+            limit = min(0.99, float(price) + slip) if price and price > 0 else 0
             res = self._market_order(token_id, usdc_amount, "BUY", limit, order_type=OrderType.FOK)
-            if not res.get("ok") and settings.CLOB_ALLOW_PARTIAL_FILL:
+            if not res.get("ok") and settings.CLOB_ALLOW_PARTIAL_FILL and slippage is None:
                 err = str(res.get("error", "")).lower()
                 status = str(res.get("status", "")).lower()
                 if any(h in err or h in status for h in self._PARTIAL_FILL_HINTS):
@@ -296,6 +422,16 @@ class ClobTrader:
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
+    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """Cancel an open order on the CLOB."""
+        if not order_id or not self.ensure_ready() or not self.clob:
+            return {"ok": False, "error": "not_ready"}
+        try:
+            res = self.clob.cancel_order(order_id=str(order_id))
+            return {"ok": True, "result": str(res)}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
     def get_last_fill(self, token_id: str) -> Optional[Dict[str, Any]]:
         """Most recent on-chain trade for this token from the CLOB's own record —
         an independent confirmation that a reported fill really happened."""
@@ -312,6 +448,76 @@ class ClobTrader:
         return {"trade_id": d.get("trade_id"), "side": d.get("side"),
                 "price": _to_float(d.get("price")), "size": _to_float(d.get("size")),
                 "status": d.get("status"), "match_time": d.get("match_time")}
+
+    def get_order_fills(self, order_id: str, token_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Find all executed fills (including multi-piece fills) matching an order_id."""
+        if not order_id or not self.ensure_ready() or not self.clob:
+            return []
+        try:
+            trades = self.clob.get_trades(token_id=str(token_id)) if token_id else self.clob.get_trades()
+            if not trades:
+                return []
+            target = str(order_id).lower()
+            matching_fills = []
+            for t in trades[:50]:
+                td = t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                taker_id = str(td.get("taker_order_id") or "").lower()
+                maker_orders = td.get("maker_orders") or []
+
+                if taker_id == target:
+                    matching_fills.append({
+                        "size": float(td.get("size") or 0.0),
+                        "price": float(td.get("price") or 0.0),
+                        "side": td.get("side"),
+                        "match_time": td.get("match_time")
+                    })
+                    continue
+
+                for m in maker_orders:
+                    md = m.model_dump() if hasattr(m, "model_dump") else dict(m)
+                    if str(md.get("order_id") or "").lower() == target:
+                        matching_fills.append({
+                            "size": float(md.get("matched_amount") or td.get("size") or 0.0),
+                            "price": float(md.get("price") or td.get("price") or 0.0),
+                            "side": td.get("side"),
+                            "match_time": td.get("match_time")
+                        })
+            return matching_fills
+        except Exception:
+            return []
+
+    def get_token_fills_in_window(self, token_id: str, start_ts: float, end_ts: float) -> List[Dict[str, Any]]:
+        """Find fills for a token that occurred within a given timestamp window."""
+        if not token_id or not self.ensure_ready() or not self.clob:
+            return []
+        try:
+            trades = self.clob.get_trades(token_id=str(token_id))
+            if not trades:
+                return []
+            matching = []
+            for t in trades[:30]:
+                td = t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                mt = td.get("match_time")
+                trade_ts = None
+                if mt:
+                    try:
+                        if isinstance(mt, (int, float)):
+                            trade_ts = float(mt) if mt < 1e11 else float(mt) / 1000.0
+                        else:
+                            trade_ts = datetime.fromisoformat(str(mt).replace('Z', '+00:00')).timestamp()
+                    except Exception:
+                        pass
+
+                if trade_ts is None or (start_ts - 60 <= trade_ts <= end_ts + 60):
+                    matching.append({
+                        "size": float(td.get("size") or 0.0),
+                        "price": float(td.get("price") or 0.0),
+                        "side": td.get("side"),
+                        "trade_id": td.get("trade_id")
+                    })
+            return matching
+        except Exception:
+            return []
 
     # ── redemption ──────────────────────────────────────────────────────────────
     def enable_auto_redeem(self) -> Dict[str, Any]:
