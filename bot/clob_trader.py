@@ -195,15 +195,32 @@ class ClobTrader:
 
     def _candidate_wallets(self, gasless) -> List[Tuple[int, str]]:
         """(signature_type, address) candidates derived from the EOA, deposit-wallet
-        (V2) first, then legacy proxy / safe."""
+        (V2) first, then legacy proxy / safe, and previous active maker address."""
         out: List[Tuple[int, str]] = []
+        try:
+            from polymarket_apis.clients.clob_client import PolymarketClobClient
+            from eth_account import Account
+            eoa = Account.from_key(settings.PRIVATE_KEY).address
+            c = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=eoa, chain_id=137, signature_type=0)
+            c.set_api_creds(self._derive_creds())
+            trades = c.get_trades()
+            if trades:
+                first = trades[0]
+                m_addr = getattr(first, "maker_address", None) or (first.get("maker_address") if isinstance(first, dict) else None)
+                if m_addr:
+                    out.append((3, m_addr))
+        except Exception:
+            pass
+
         for st, getter in (
             (3, gasless.get_expected_deposit_wallet),
             (1, gasless.get_poly_proxy_wallet_address),
             (2, gasless.get_safe_proxy_wallet_address),
         ):
             try:
-                out.append((st, getter()))
+                addr = getter()
+                if not any(a.lower() == addr.lower() for _, a in out):
+                    out.append((st, addr))
             except Exception:
                 pass
         return out
@@ -211,6 +228,23 @@ class ClobTrader:
     def _pick_funded_wallet(self, gasless) -> Tuple[int, str]:
         """Trade from where the money actually is: pick the candidate holding pUSD.
         Falls back to the deposit wallet when every balance reads 0."""
+        try:
+            from polymarket_apis.clients.clob_client import PolymarketClobClient
+            from eth_account import Account
+            eoa = Account.from_key(settings.PRIVATE_KEY).address
+            c = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=eoa, chain_id=137, signature_type=3)
+            c.set_api_creds(self._derive_creds())
+            clob_bal = float(c.get_pusd_balance())
+            if clob_bal > 0:
+                trades = c.get_trades()
+                if trades:
+                    first = trades[0]
+                    m_addr = getattr(first, "maker_address", None) or (first.get("maker_address") if isinstance(first, dict) else None)
+                    if m_addr:
+                        return 3, m_addr
+        except Exception:
+            pass
+
         best = None  # (sig_type, addr, balance)
         for st, addr in self._candidate_wallets(gasless):
             try:
@@ -634,6 +668,27 @@ class ClobTrader:
                     bal = None
                 wallets.append({"signature_type": st, "address": addr, "pusd_balance": bal})
             sig_type, funder = self._pick_funded_wallet(probe)
+
+            # Query CLOB API directly for true tradeable balance
+            clob_bal = None
+            try:
+                from polymarket_apis.clients.clob_client import PolymarketClobClient
+                c = PolymarketClobClient(
+                    private_key=settings.PRIVATE_KEY,
+                    address=funder,
+                    chain_id=137,
+                    signature_type=sig_type
+                )
+                c.set_api_creds(c.create_or_derive_api_creds())
+                clob_bal = float(c.get_pusd_balance())
+            except Exception:
+                pass
+
+            if clob_bal is not None and clob_bal > 0:
+                for w in wallets:
+                    if w["signature_type"] == sig_type:
+                        w["pusd_balance"] = clob_bal
+
             return {
                 "ok": True,
                 "eoa": eoa,
@@ -650,6 +705,16 @@ class ClobTrader:
         V2 collateral; this is the deposit wallet's tradeable balance."""
         if not settings.PRIVATE_KEY:
             return None
+        # First priority: Query Polymarket CLOB API directly (accurate for CLOB deposits)
+        try:
+            if self.ensure_ready() and self.clob is not None:
+                c_bal = float(self.clob.get_pusd_balance())
+                if c_bal is not None and c_bal >= 0:
+                    return c_bal
+        except Exception:
+            pass
+
+        # Fallback to gasless / on-chain query
         try:
             if self.ready and self.gasless is not None and self.funder:
                 return float(self.gasless.get_pusd_balance(address=self.funder))

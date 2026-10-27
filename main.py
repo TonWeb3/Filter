@@ -56,6 +56,13 @@ def _sync_active_trades_to_latest_data():
                 except Exception:
                     pass
         ts["live_open_cost"] = round(live_open_val, 2)
+        ts["open_value"] = live_open_val
+        is_live = state.get("trading_mode") == "live" or (state.get("trading_mode") == "hybrid" and bool(settings.PRIVATE_KEY))
+        live_bal = float(state.get("live_balance") or 0.0)
+        curr_bal = live_bal if (is_live and settings.PRIVATE_KEY) else float(state.get("paper_balance", 0.0))
+        ts["balance"] = curr_bal
+        ts["equity"] = curr_bal + live_open_val
+        ts["has_live_creds"] = bool(settings.PRIVATE_KEY)
 
 def _wake_entry(data_payload=None):
     _market_event.set()
@@ -1406,6 +1413,9 @@ async def live_balance_updater():
                 if bal is not None and bal >= 0:
                     state["live_balance"] = bal
                     state["last_balance_refresh"] = time.time()
+                    if state.get("trading_mode") == "live":
+                        state["paper_balance"] = bal
+                    _sync_active_trades_to_latest_data()
 
                     # Precompute the exact trade amount for the next live trade
                     risk_type = (settings.RISK_TYPE or "percent").lower()
@@ -1646,16 +1656,11 @@ async def update_loop():
                     t["unrealized_pl"] = None
                     open_value += t["amount"]
 
-            # Live balance refresh
-            if state["trading_mode"] == "live":
-                now_ts = time.time()
-                if now_ts - state.get("last_balance_refresh", 0) > 30:
-                    real_bal = await asyncio.to_thread(clob_trader.get_usdc_balance)
-                    if real_bal is not None:
-                        state["paper_balance"] = real_bal
-                    state["last_balance_refresh"] = now_ts
-
-            total_equity = state["paper_balance"] + open_value
+            # Live balance maintained with 0ms delay by background live_balance_updater
+            is_live = state["trading_mode"] == "live" or (state["trading_mode"] == "hybrid" and bool(settings.PRIVATE_KEY))
+            live_bal = float(state.get("live_balance") or 0.0)
+            current_balance = live_bal if (is_live and settings.PRIVATE_KEY) else float(state["paper_balance"])
+            total_equity = current_balance + open_value
             await maybe_auto_withdraw(total_equity, poly_snapshot)
 
             signal_label = f"BUY {decision['side']}" if decision["action"] == "ENTER" else "NO TRADE"
@@ -1673,8 +1678,10 @@ async def update_loop():
                 "trading_state": {
                     "mode": state["trading_mode"],
                     "running": state["running"],
-                    "balance": state["paper_balance"],
-                    "live_balance": state.get("live_balance", 0.0),
+                    "balance": current_balance,
+                    "paper_balance": state["paper_balance"],
+                    "live_balance": live_bal,
+                    "has_live_creds": bool(settings.PRIVATE_KEY),
                     "precomputed_live_stake": state.get("precomputed_live_stake", 0.0),
                     "equity": total_equity,
                     "open_value": open_value,
@@ -2207,4 +2214,4 @@ async def get_history():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8040)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
