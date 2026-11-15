@@ -2,118 +2,17 @@ import asyncio
 import json
 import aiohttp
 import time
-from typing import Optional, Callable, Dict, List
-from .config import settings
+from typing import Optional, Dict, List
 from .net_utils import get_proxy_url_for
 
-class PolymarketChainlinkStream:
-    def __init__(self, ws_url: str, symbol_includes: str = "btc", on_update: Optional[Callable] = None):
-        self.ws_url = ws_url
-        self.symbol_includes = symbol_includes.lower()
-        self.on_update = on_update
-        self.last_price = None
-        self.last_updated_at = None
-        self.closed = False
-
-    async def start(self):
-        if not self.ws_url:
-            return
-
-        async def ping_loop(ws):
-            while not self.closed:
-                try:
-                    await ws.send_str("PING")
-                    await asyncio.sleep(5)
-                except:
-                    break
-
-        while not self.closed:
-            try:
-                proxy = get_proxy_url_for(self.ws_url)
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                }
-                async with aiohttp.ClientSession(headers=headers) as session:
-                    print(f"Connecting to Polymarket WS: {self.ws_url}")
-                    async with session.ws_connect(self.ws_url, proxy=proxy if proxy else None) as ws:
-                        print(f"Connected to Polymarket WS. Subscribing to topics...")
-
-                        topics = ["crypto_prices_chainlink", "price_chainlink", "settlement_prices"]
-                        for t in topics:
-                            await ws.send_json({"action": "subscribe", "topic": t})
-
-                        asyncio.create_task(ping_loop(ws))
-
-                        while not self.closed:
-                            msg = await ws.receive()
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_text = msg.data
-                                if data_text in ("PONG", "OK", "PONG\n"):
-                                    continue
-
-                                try:
-                                    data_msg = json.loads(data_text)
-                                except Exception:
-                                    continue
-
-                                topic = data_msg.get("topic")
-                                if topic not in ("crypto_prices_chainlink", "price_chainlink", "settlement_prices"):
-                                    continue
-
-                                payload = data_msg.get("payload", {})
-                                if isinstance(payload, str):
-                                    try:
-                                        payload = json.loads(payload)
-                                    except:
-                                        continue
-
-                                updates = payload if isinstance(payload, list) else [payload]
-
-                                for update in updates:
-                                    if not isinstance(update, dict): continue
-
-                                    sym = str(update.get("symbol") or update.get("pair") or update.get("ticker") or update.get("asset") or "").lower()
-                                    if self.symbol_includes:
-                                        target = self.symbol_includes.lower()
-                                        if target not in sym and not (target == "btc" and "bitcoin" in sym):
-                                            continue
-
-                                    try:
-                                        price_val = update.get("price") or update.get("value") or update.get("current")
-                                        if price_val is not None:
-                                            self.last_price = float(price_val)
-                                            ts_val = update.get("timestamp") or update.get("updated_at") or time.time()
-                                            updated_at = float(ts_val)
-                                            if updated_at < 10000000000: updated_at *= 1000
-                                            self.last_updated_at = updated_at
-
-                                            if self.on_update:
-                                                res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "polymarket_ws"})
-                                                if asyncio.iscoroutine(res):
-                                                    asyncio.create_task(res)
-                                    except:
-                                        continue
-
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
-            except Exception as e:
-                print(f"WS Error (Polymarket): {e}")
-                if not self.closed:
-                    await asyncio.sleep(2)
-
-    def get_last(self):
-        return {"price": self.last_price, "updatedAt": self.last_updated_at, "source": "polymarket_ws"}
-
-    def close(self):
-        self.closed = True
 
 class PolymarketClobMarketStream:
     """Real-time orderbook and price feed for active Polymarket tokens over CLOB Market WS."""
     def __init__(self, ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"):
         self.ws_url = ws_url
         self.asset_ids: List[str] = []
-        self.books: Dict[str, Dict] = {} # asset_id -> {"bids": [...], "asks": [...], "best_bid": float, "best_ask": float}
-        self.book_levels: Dict[str, Dict[str, Dict[float, float]]] = {} # asset_id -> {"bids": {px: sz}, "asks": {px: sz}}
+        self.books: Dict[str, Dict] = {}  # asset_id -> {"bids": [...], "asks": [...], "best_bid": float, "best_ask": float}
+        self.book_levels: Dict[str, Dict[str, Dict[float, float]]] = {}  # asset_id -> {"bids": {px: sz}, "asks": {px: sz}}
         self.last_ts: float = 0
         self.closed = False
         self._ws = None
@@ -145,7 +44,7 @@ class PolymarketClobMarketStream:
                     await asyncio.sleep(10)
                     if not ws.closed:
                         await ws.send_str("PING")
-                except:
+                except Exception:
                     break
 
         while not self.closed:
@@ -230,11 +129,15 @@ class PolymarketClobMarketStream:
                             pass
                 self._sync_book_entry(aid)
                 if data.get("best_bid") is not None:
-                    try: self.books[aid]["best_bid"] = float(data["best_bid"])
-                    except: pass
+                    try:
+                        self.books[aid]["best_bid"] = float(data["best_bid"])
+                    except Exception:
+                        pass
                 if data.get("best_ask") is not None:
-                    try: self.books[aid]["best_ask"] = float(data["best_ask"])
-                    except: pass
+                    try:
+                        self.books[aid]["best_ask"] = float(data["best_ask"])
+                    except Exception:
+                        pass
 
         # Full book snapshot (list)
         elif isinstance(data, list):
@@ -256,52 +159,70 @@ class PolymarketClobMarketStream:
                             pass
                     self._sync_book_entry(aid)
                     if item.get("best_bid") is not None:
-                        try: self.books[aid]["best_bid"] = float(item["best_bid"])
-                        except: pass
+                        try:
+                            self.books[aid]["best_bid"] = float(item["best_bid"])
+                        except Exception:
+                            pass
                     if item.get("best_ask") is not None:
-                        try: self.books[aid]["best_ask"] = float(item["best_ask"])
-                        except: pass
+                        try:
+                            self.books[aid]["best_ask"] = float(item["best_ask"])
+                        except Exception:
+                            pass
 
         # Price / book delta updates
         elif isinstance(data, dict):
             price_changes = data.get("price_changes") or data.get("changes") or []
             if isinstance(price_changes, list):
                 for pc in price_changes:
-                    if not isinstance(pc, dict): continue
+                    if not isinstance(pc, dict):
+                        continue
                     aid = str(pc.get("asset_id") or data.get("asset_id") or "")
-                    if not aid: continue
+                    if not aid:
+                        continue
                     levels = self.book_levels.setdefault(aid, {"bids": {}, "asks": {}})
                     side = str(pc.get("side", "")).upper()
                     try:
                         p = float(pc["price"])
                         s = float(pc.get("size", 0))
                         if side == "BUY":
-                            if s > 0: levels["bids"][p] = s
-                            else: levels["bids"].pop(p, None)
+                            if s > 0:
+                                levels["bids"][p] = s
+                            else:
+                                levels["bids"].pop(p, None)
                         elif side == "SELL":
-                            if s > 0: levels["asks"][p] = s
-                            else: levels["asks"].pop(p, None)
+                            if s > 0:
+                                levels["asks"][p] = s
+                            else:
+                                levels["asks"].pop(p, None)
                     except (TypeError, ValueError, KeyError):
                         pass
 
                     self._sync_book_entry(aid)
                     if pc.get("best_bid") is not None:
-                        try: self.books[aid]["best_bid"] = float(pc["best_bid"])
-                        except (TypeError, ValueError): pass
+                        try:
+                            self.books[aid]["best_bid"] = float(pc["best_bid"])
+                        except (TypeError, ValueError):
+                            pass
                     if pc.get("best_ask") is not None:
-                        try: self.books[aid]["best_ask"] = float(pc["best_ask"])
-                        except (TypeError, ValueError): pass
+                        try:
+                            self.books[aid]["best_ask"] = float(pc["best_ask"])
+                        except (TypeError, ValueError):
+                            pass
 
             aid = str(data.get("asset_id") or "")
             if aid:
                 if aid in self.books:
                     self.books[aid]["updated_at"] = self.last_ts
                     if data.get("best_bid") is not None:
-                        try: self.books[aid]["best_bid"] = float(data["best_bid"])
-                        except (TypeError, ValueError): pass
+                        try:
+                            self.books[aid]["best_bid"] = float(data["best_bid"])
+                        except (TypeError, ValueError):
+                            pass
                     if data.get("best_ask") is not None:
-                        try: self.books[aid]["best_ask"] = float(data["best_ask"])
-                        except (TypeError, ValueError): pass
+                        try:
+                            self.books[aid]["best_ask"] = float(data["best_ask"])
+                        except (TypeError, ValueError):
+                            pass
 
     def get_token_market(self, asset_id: str) -> Dict:
         return self.books.get(str(asset_id), {})
@@ -323,12 +244,12 @@ class PolymarketClobMarketStream:
         if best_bid is None and bids:
             try:
                 best_bid = float(bids[0].get("px", bids[0]["price"]))
-            except:
+            except Exception:
                 pass
         if best_ask is None and asks:
             try:
                 best_ask = float(asks[0].get("px", asks[0]["price"]))
-            except:
+            except Exception:
                 pass
 
         spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
@@ -337,14 +258,14 @@ class PolymarketClobMarketStream:
         for b in bids[:5]:
             try:
                 bid_liq += float(b.get("size", 0))
-            except:
+            except Exception:
                 pass
 
         ask_liq = 0.0
         for a in asks[:5]:
             try:
                 ask_liq += float(a.get("size", 0))
-            except:
+            except Exception:
                 pass
 
         return {
@@ -357,77 +278,6 @@ class PolymarketClobMarketStream:
             "asks": asks,
             "updated_at": updated_at
         }
-
-    def close(self):
-        self.closed = True
-
-class ChainlinkPriceStream:
-    def __init__(self, aggregator: str, decimals: int = 8, on_update: Optional[Callable] = None):
-        self.aggregator = aggregator
-        self.decimals = decimals
-        self.on_update = on_update
-        self.last_price = None
-        self.last_updated_at = None
-        self.closed = False
-        self.wss_urls = settings.POLYGON_WSS_URLS + ([settings.POLYGON_WSS_URL] if settings.POLYGON_WSS_URL else [])
-
-    async def start(self):
-        if not self.wss_urls or not self.aggregator:
-            return
-
-        url_idx = 0
-        while not self.closed:
-            url = self.wss_urls[url_idx % len(self.wss_urls)]
-            url_idx += 1
-            try:
-                proxy = get_proxy_url_for(url)
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, proxy=proxy if proxy else None) as ws:
-                        print(f"Connected to Chainlink RPC WS: {url}")
-                        sub_msg = {
-                            "jsonrpc": "2.0",
-                            "id": 1,
-                            "method": "eth_subscribe",
-                            "params": [
-                                "logs",
-                                {
-                                    "address": self.aggregator,
-                                    "topics": ["0x05598845ccd9c46647361c770d3023029a3514781ca1029c91d84f2913e79435"] # AnswerUpdated topic
-                                }
-                            ]
-                        }
-                        await ws.send_json(sub_msg)
-
-                        while not self.closed:
-                            msg = await ws.receive()
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_res = json.loads(msg.data)
-                                if data_res.get("method") == "eth_subscription":
-                                    log = data_res.get("params", {}).get("result", {})
-                                    topics = log.get("topics", [])
-                                    if len(topics) >= 2:
-                                        answer = int(topics[1], 16)
-                                        if answer >= 2**255:
-                                            answer -= 2**256
-
-                                        self.last_price = answer / (10 ** self.decimals)
-                                        data_hex = log.get("data", "0x")
-                                        if len(data_hex) >= 66:
-                                            self.last_updated_at = int(data_hex[2:66], 16) * 1000
-
-                                        if self.on_update:
-                                            res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"})
-                                            if asyncio.iscoroutine(res):
-                                                asyncio.create_task(res)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
-            except Exception as e:
-                print(f"WS Error (Chainlink RPC): {e}")
-                if not self.closed:
-                    await asyncio.sleep(2)
-
-    def get_last(self):
-        return {"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"}
 
     def close(self):
         self.closed = True

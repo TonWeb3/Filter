@@ -17,7 +17,6 @@ import httpx
 from bot.config import settings, CONFIG_PATH
 import bot.data as data
 import bot.ws_data as ws_data
-import bot.chainlink as chainlink
 import bot.indicators as indicators
 import bot.engines as engines
 import bot.utils as utils
@@ -245,13 +244,7 @@ async def broadcast_state():
     for ws in dead:
         _ws_clients.discard(ws)
 
-# ── Background task streams (Chainlink-only POB-main architecture) ────────────
-def get_ws_symbol_filter(symbol: str) -> str:
-    s = symbol.upper()
-    if s.endswith("USDT"):
-        return s[:-4].lower()
-    return s.lower()
-
+# ── Background task streams (100% PolyBolt + CLOB Market WS) ─────────────────
 _chainlink_grid_prices: deque = deque(maxlen=17280)  # 24h of 5s Chainlink samples
 _last_grid_sample_ts: float = 0.0
 
@@ -267,11 +260,6 @@ def _record_chainlink_sample(price: Optional[float], now_ts: Optional[float] = N
     if not _chainlink_grid_prices or (t - _last_grid_sample_ts) >= 5.0:
         _chainlink_grid_prices.append(float(price))
         _last_grid_sample_ts = t
-
-def _on_chainlink_tick(data_payload=None):
-    if isinstance(data_payload, dict) and data_payload.get("price"):
-        _record_chainlink_sample(data_payload.get("price"))
-    _wake_entry(data_payload)
 
 # ── PolyBolt (wss://ws-live-v2.polymarket.com/ws) integration ────────────────
 def _ps_use(what: str) -> bool:
@@ -297,15 +285,6 @@ polybolt_feed = polybolt.PolyBolt(
     proxy=ws_data.get_proxy_url_for(polybolt.URL) or None,
     on_live=_ps_on_live,
 )
-
-def _ps_live_as_poly_ws(poly_ws: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
-    """update_loop: with 'prices' on and a fresh live Chainlink price on PolyBolt,
-    hand it to update_loop in the shape of polymarket_ws_stream.get_last()."""
-    if _ps_use("prices"):
-        pt = polybolt_feed.live(POLY_WS_MAX_AGE_MS / 1000.0)
-        if pt:
-            return {"price": pt[1], "updatedAt": pt[0] * 1000.0}, True
-    return poly_ws, False
 
 def _ps_strike(start_ms: int, strike_open: Optional[float], strike_source: str) -> Tuple[Optional[float], str]:
     """update_loop: the window's strike (price to beat).
@@ -357,16 +336,7 @@ def _ps_settle_call(trade: Dict[str, Any]) -> Optional[Tuple[bool, float, float]
     # POB-main resolution rule: up_won = 1.0 if settle > strike else 0.0
     return (closed > opened), opened, closed
 
-polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
-    ws_url=settings.POLYMARKET_LIVE_DATA_WS_URL,
-    symbol_includes=get_ws_symbol_filter(settings.SYMBOL),
-    on_update=_on_chainlink_tick
-)
 polymarket_clob_ws = ws_data.PolymarketClobMarketStream()
-chainlink_ws_stream = ws_data.ChainlinkPriceStream(
-    aggregator=settings.get_aggregator(settings.SYMBOL),
-    on_update=_on_chainlink_tick
-)
 
 def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
     now_ms = time.time() * 1000
@@ -1076,12 +1046,7 @@ async def evaluate_entry(reason: str = "event"):
             return
 
         ps_live = polybolt_feed.live(POLY_WS_MAX_AGE_MS / 1000.0) if _ps_use("prices") else None
-        spot_price = (
-            (ps_live[1] if ps_live else None)
-            or polymarket_ws_stream.get_last().get("price")
-            or chainlink_ws_stream.get_last().get("price")
-            or ctx.get("spot_price")
-        )
+        spot_price = (ps_live[1] if ps_live else None) or ctx.get("spot_price")
         if not spot_price:
             return
 
@@ -1172,39 +1137,32 @@ async def update_loop():
         try:
             timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
 
-            poly_ws, poly_from_ps = _ps_live_as_poly_ws(polymarket_ws_stream.get_last())
-            cl_ws = chainlink_ws_stream.get_last()
+            try:
+                poly_snapshot = await fetch_polymarket_snapshot()
+            except Exception:
+                poly_snapshot = {"ok": False}
 
-            results = await asyncio.gather(
-                chainlink.chainlink_fetcher.fetch_chainlink_btc_usd(),
-                fetch_polymarket_snapshot(),
-                return_exceptions=True
-            )
-
-            chainlink_data = results[0] if not isinstance(results[0], Exception) else {}
-            poly_snapshot = results[1] if not isinstance(results[1], Exception) else {"ok": False}
-
-            # Settle & Spot feed (100% Chainlink, matching POB-main)
+            # Settle & Spot feed (100% PolyBolt Chainlink, matching POB-main)
             current_price = None
             price_source = None
-            price_is_fresh = True
-            poly_updated = poly_ws.get("updatedAt") or 0
-            if poly_ws.get("price"):
-                current_price = poly_ws["price"]
-                price_source = "PolyBolt WS" if poly_from_ps else "Polymarket WS"
-                if poly_updated > 0:
-                    age_ms = (time.time() * 1000) - poly_updated
-                    if age_ms > POLY_WS_MAX_AGE_MS:
-                        price_is_fresh = False
-            elif cl_ws.get("price"):
-                current_price = cl_ws["price"]
-                price_source = "Chainlink RPC WS"
-            elif chainlink_data.get("price"):
-                current_price = chainlink_data["price"]
-                price_source = "Chainlink RPC REST"
+            price_is_fresh = False
+            poly_updated = 0.0
+            if _ps_use("prices"):
+                ps_pt = polybolt_feed.live(POLY_WS_MAX_AGE_MS / 1000.0)
+                if ps_pt:
+                    current_price = ps_pt[1]
+                    poly_updated = ps_pt[0] * 1000.0
+                    price_source = "PolyBolt WS"
+                    price_is_fresh = True
+                elif polybolt_feed.live_pts:
+                    current_price = polybolt_feed.live_pts[-1][1]
+                    poly_updated = polybolt_feed.live_pts[-1][0] * 1000.0
+                    price_source = "PolyBolt WS (stale)"
+                    price_is_fresh = False
 
             spot_price = current_price
-            _record_chainlink_sample(spot_price)
+            if price_is_fresh:
+                _record_chainlink_sample(spot_price)
 
             window_ms = settings.CANDLE_WINDOW_MINUTES * 60_000
             event_start_ms = None
@@ -1450,9 +1408,7 @@ async def lifespan(app: FastAPI):
 
     tasks = [
         asyncio.create_task(polybolt_feed.run_forever()),
-        asyncio.create_task(polymarket_ws_stream.start()),
         asyncio.create_task(polymarket_clob_ws.start()),
-        asyncio.create_task(chainlink_ws_stream.start()),
         asyncio.create_task(update_loop()),
         asyncio.create_task(telegram_poller()),
         asyncio.create_task(entry_watcher())
@@ -1464,9 +1420,7 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
     polybolt_feed.close()
-    polymarket_ws_stream.close()
     polymarket_clob_ws.close()
-    chainlink_ws_stream.close()
 
 app = FastAPI(title="Polymarket BTC 15m Assistant", lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
@@ -1631,7 +1585,6 @@ async def get_settings():
 
 @app.post("/api/settings")
 async def post_settings(new_settings: Dict[str, Any]):
-    global polymarket_ws_stream, chainlink_ws_stream
     old_symbol = settings.SYMBOL
 
     new_pk = new_settings.get("private_key")
@@ -1748,21 +1701,6 @@ async def post_settings(new_settings: Dict[str, Any]):
     if settings.SYMBOL != old_symbol:
         _chainlink_grid_prices.clear()
         polybolt_feed.set_symbol(polybolt.symbol_for(settings.SYMBOL))
-
-        polymarket_ws_stream.close()
-        polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
-            ws_url=settings.POLYMARKET_LIVE_DATA_WS_URL,
-            symbol_includes=get_ws_symbol_filter(settings.SYMBOL),
-            on_update=_on_chainlink_tick
-        )
-        asyncio.create_task(polymarket_ws_stream.start())
-
-        chainlink_ws_stream.close()
-        chainlink_ws_stream = ws_data.ChainlinkPriceStream(
-            aggregator=settings.get_aggregator(settings.SYMBOL),
-            on_update=_on_chainlink_tick
-        )
-        asyncio.create_task(chainlink_ws_stream.start())
 
     await broadcast_state()
     return {"status": "ok"}
