@@ -12,48 +12,6 @@ def to_number(x) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-async def fetch_klines(symbol: str, interval: str, limit: int) -> List[Dict]:
-    """Fetch historical klines with automatic retry and validation to guarantee full
-    dataset for indicator computation (HA & RSI)."""
-    url = f"{settings.BINANCE_BASE_URL}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    proxy = get_proxy_url_for(url)
-    last_err = None
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
-                res = await client.get(url, params=params)
-                res.raise_for_status()
-                data = res.json()
-                if not isinstance(data, list) or len(data) == 0:
-                    continue
-                klines = [{
-                    "openTime": int(k[0]),
-                    "open": to_number(k[1]),
-                    "high": to_number(k[2]),
-                    "low": to_number(k[3]),
-                    "close": to_number(k[4]),
-                    "volume": to_number(k[5]),
-                    "closeTime": int(k[6])
-                } for k in data if len(k) >= 7 and to_number(k[4]) is not None]
-                if len(klines) >= min(limit, 15):
-                    return klines
-        except Exception as e:
-            last_err = e
-    if last_err:
-        print(f"Warning: fetch_klines failed after retries: {last_err}")
-    return []
-
-async def fetch_last_price(symbol: str) -> Optional[float]:
-    url = f"{settings.BINANCE_BASE_URL}/api/v3/ticker/price"
-    params = {"symbol": symbol}
-    proxy = get_proxy_url_for(url)
-    async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
-        res = await client.get(url, params=params)
-        res.raise_for_status()
-        data = res.json()
-        return to_number(data.get("price"))
-
 async def fetch_market_by_slug(slug: str) -> Optional[Dict]:
     url = f"{settings.GAMMA_BASE_URL}/markets"
     params = {"slug": slug}

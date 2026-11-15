@@ -4,8 +4,9 @@ import json
 import os
 import math
 import re
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from collections import deque
+from datetime import datetime
+from typing import Dict, Any, Optional, List, Tuple
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -20,6 +21,7 @@ import bot.chainlink as chainlink
 import bot.indicators as indicators
 import bot.engines as engines
 import bot.utils as utils
+import bot.polybolt as polybolt
 from bot.clob_trader import clob_trader
 
 STATE_PATH = "state_data.json"
@@ -33,36 +35,12 @@ _ws_clients = set()
 MIN_EVAL_INTERVAL_S = 0.25
 CTX_MAX_AGE_S = 4.0
 POLY_WS_MAX_AGE_MS = 2500
-MARK_CAPTURE_WINDOW_MS = 20_000
+STRIKE_WAIT_MS = 2500
+MARK_CAPTURE_WINDOW_MS = 30_000
 
 _market_event = asyncio.Event()
 _entry_lock = asyncio.Lock()
-_trade_lock = asyncio.Lock()
-_in_flight_markets = set()
-_executed_windows = set()  # Strict Lockout: never re-enter executed windows
 _last_eval_ts = 0.0
-
-def _sync_active_trades_to_latest_data():
-    if "trading_state" in state.get("latest_data", {}):
-        ts = state["latest_data"]["trading_state"]
-        ts["active_trades"] = list(state["active_trades"])
-        live_open_val = 0.0
-        for t in state["active_trades"]:
-            if t.get("live_status") == "FILLED" and t.get("live_shares"):
-                try:
-                    s = float(t.get("live_shares") or 0.0)
-                    p = float(t.get("live_mark_price") or t.get("live_entry_price") or 0.0)
-                    live_open_val += s * p
-                except Exception:
-                    pass
-        ts["live_open_cost"] = round(live_open_val, 2)
-        ts["open_value"] = live_open_val
-        is_live = state.get("trading_mode") == "live" or (state.get("trading_mode") == "hybrid" and bool(settings.PRIVATE_KEY))
-        live_bal = float(state.get("live_balance") or 0.0)
-        curr_bal = live_bal if (is_live and settings.PRIVATE_KEY) else float(state.get("paper_balance", 0.0))
-        ts["balance"] = curr_bal
-        ts["equity"] = curr_bal + live_open_val
-        ts["has_live_creds"] = bool(settings.PRIVATE_KEY)
 
 def _wake_entry(data_payload=None):
     _market_event.set()
@@ -75,8 +53,6 @@ state = {
     "last_update_ts": 0,
     "trading_mode": settings.MODE,
     "paper_balance": settings.PAPER_BALANCE_USD,
-    "live_balance": 0.0,
-    "precomputed_live_stake": 0.0,
     "active_trades": [],
     "trade_history": [],
     "logs": [],
@@ -88,9 +64,6 @@ state = {
     "market_opens": {},
     "last_window_start": None,
     "last_seen_price": None,
-    # Stage 7 Circuit Breaker State
-    "consecutive_losses": 0,
-    "cb_pause_until_ms": 0,
     # Capital extractor
     "withdraw_state": "idle",  # "idle" | "in_progress" | "cooldown"
     "last_withdrawal": None,
@@ -118,13 +91,10 @@ def save_state():
     try:
         data_to_save = {
             "paper_balance": state["paper_balance"],
-            "live_balance": state.get("live_balance", 0.0),
             "active_trades": state["active_trades"],
             "trade_history": state["trade_history"],
             "last_trade_side": state["last_trade_side"],
             "last_withdrawal": state.get("last_withdrawal"),
-            "consecutive_losses": state.get("consecutive_losses", 0),
-            "cb_pause_until_ms": state.get("cb_pause_until_ms", 0),
         }
         with open(STATE_PATH, "w") as f:
             json.dump(data_to_save, f, indent=2)
@@ -146,22 +116,11 @@ def load_state():
             with open(STATE_PATH, "r") as f:
                 loaded = json.load(f)
                 state["paper_balance"] = loaded.get("paper_balance", settings.PAPER_BALANCE_USD)
-                state["live_balance"] = loaded.get("live_balance", 0.0)
                 state["active_trades"] = loaded.get("active_trades", [])
                 state["trade_history"] = loaded.get("trade_history", [])
                 state["last_trade_side"] = loaded.get("last_trade_side")
                 state["last_withdrawal"] = loaded.get("last_withdrawal")
-                state["consecutive_losses"] = loaded.get("consecutive_losses", 0)
-                state["cb_pause_until_ms"] = loaded.get("cb_pause_until_ms", 0)
                 log_message(f"State loaded from {STATE_PATH}")
-                for t in state.get("trade_history", []):
-                    if t.get("market_id"): _executed_windows.add(str(t["market_id"]))
-                    if t.get("market_slug"): _executed_windows.add(str(t["market_slug"]))
-                    if t.get("window_start_ms"): _executed_windows.add(str(t["window_start_ms"]))
-                for t in state.get("active_trades", []):
-                    if t.get("market_id"): _executed_windows.add(str(t["market_id"]))
-                    if t.get("market_slug"): _executed_windows.add(str(t["market_slug"]))
-                    if t.get("window_start_ms"): _executed_windows.add(str(t["window_start_ms"]))
     except Exception as e:
         print(f"Error loading state: {e}")
 
@@ -286,24 +245,128 @@ async def broadcast_state():
     for ws in dead:
         _ws_clients.discard(ws)
 
-# ── Background task streams ───────────────────────────────────────────────────
+# ── Background task streams (Chainlink-only POB-main architecture) ────────────
 def get_ws_symbol_filter(symbol: str) -> str:
     s = symbol.upper()
     if s.endswith("USDT"):
         return s[:-4].lower()
     return s.lower()
 
-binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_update=_wake_entry)
-binance_kline_1m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="1m", limit=240)
-binance_kline_5m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="5m", limit=200)
-binance_kline_15m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="15m", limit=60)
+_chainlink_grid_prices: deque = deque(maxlen=17280)  # 24h of 5s Chainlink samples
+_last_grid_sample_ts: float = 0.0
+
+def _record_chainlink_sample(price: Optional[float], now_ts: Optional[float] = None):
+    global _last_grid_sample_ts
+    if price is None or price <= 0:
+        return
+    t = float(now_ts) if now_ts is not None else time.time()
+    # If PolyBolt's 2-minute historical snapshot arrives right after startup, backfill it cleanly
+    if t < _last_grid_sample_ts - 5.0 and len(_chainlink_grid_prices) < 5:
+        _chainlink_grid_prices.clear()
+        _last_grid_sample_ts = 0.0
+    if not _chainlink_grid_prices or (t - _last_grid_sample_ts) >= 5.0:
+        _chainlink_grid_prices.append(float(price))
+        _last_grid_sample_ts = t
+
+def _on_chainlink_tick(data_payload=None):
+    if isinstance(data_payload, dict) and data_payload.get("price"):
+        _record_chainlink_sample(data_payload.get("price"))
+    _wake_entry(data_payload)
+
+# ── PolyBolt (wss://ws-live-v2.polymarket.com/ws) integration ────────────────
+def _ps_use(what: str) -> bool:
+    return polybolt.use(settings.PRICE_STREAM, what)
+
+def _ps_tol() -> float:
+    return float((settings.PRICE_STREAM or {}).get("pick_tolerance_s", 2.0))
+
+def _ps_creds() -> Optional[Dict[str, str]]:
+    """PolyBolt's login: derives CLOB API credentials from PRIVATE_KEY in both paper and live mode."""
+    return clob_trader.get_api_creds_dict()
+
+def _ps_on_live(ts: float, price: float) -> None:
+    """Every new Chainlink tick on PolyBolt's price.crypto channel."""
+    _record_chainlink_sample(price, ts)
+    _wake_entry({"price": price, "updatedAt": ts * 1000.0, "source": "polybolt_ws"})
+
+polybolt_feed = polybolt.PolyBolt(
+    get_creds=_ps_creds,
+    enabled=lambda: polybolt.on(settings.PRICE_STREAM),
+    log=lambda m: log_message(m),
+    symbol=polybolt.symbol_for(settings.SYMBOL),
+    proxy=ws_data.get_proxy_url_for(polybolt.URL) or None,
+    on_live=_ps_on_live,
+)
+
+def _ps_live_as_poly_ws(poly_ws: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """update_loop: with 'prices' on and a fresh live Chainlink price on PolyBolt,
+    hand it to update_loop in the shape of polymarket_ws_stream.get_last()."""
+    if _ps_use("prices"):
+        pt = polybolt_feed.live(POLY_WS_MAX_AGE_MS / 1000.0)
+        if pt:
+            return {"price": pt[1], "updatedAt": pt[0] * 1000.0}, True
+    return poly_ws, False
+
+def _ps_strike(start_ms: int, strike_open: Optional[float], strike_source: str) -> Tuple[Optional[float], str]:
+    """update_loop: the window's strike (price to beat).
+    With 'prices' on and Polymarket's 60-second average for the window's start published,
+    use that average; else fall back to the bot's own instant Chainlink strike."""
+    if not _ps_use("prices"):
+        return strike_open, strike_source
+    ptb = polybolt_feed.twap_at(start_ms / 1000.0, _ps_tol())
+    return (ptb, "polymarket_twap") if ptb is not None else (strike_open, strike_source)
+
+_ps_window_logged: Dict[int, str] = {}
+
+def _ps_window_note(start_ms: int, window_ms: int, own_strike: Optional[float]) -> None:
+    """One log line per window once Polymarket's 60-second average for its start is known."""
+    if not polybolt.on(settings.PRICE_STREAM):
+        return
+    pt = polybolt_feed.twap_point_at(start_ms / 1000.0, _ps_tol())
+    if pt is not None and _ps_window_logged.get(start_ms) != "ptb":
+        _ps_window_logged[start_ms] = "ptb"
+        avg, late = pt[1], pt[0] - start_ms / 1000.0
+        label = datetime.fromtimestamp(start_ms / 1000).strftime('%H:%M')
+        text = (f"PRICE STREAM: Polymarket's 60-second average at {label}"
+                + (f" (stamped {late:.1f}s after it)" if late >= 0.05 else "")
+                + f" is {avg:,.2f}: the {label} window's price to beat.")
+        if own_strike:
+            gap = own_strike - avg
+            text += f" The bot's own strike: {own_strike:,.2f} ({gap:+.2f})."
+        log_message(text)
+    for k in [k for k in _ps_window_logged if k < start_ms - 4 * window_ms]:
+        del _ps_window_logged[k]
+
+def _ps_settle_call(trade: Dict[str, Any]) -> Optional[Tuple[bool, float, float]]:
+    """update_trades: (up_won, open_twap, close_twap) from Polymarket's 60-second average
+    at both ends of the trade's window, or None if 'settle' is off or either average is missing."""
+    if not _ps_use("settle"):
+        return None
+    end_ts = float(trade.get("end_ts") or 0.0)
+    if end_ts <= 0:
+        return None
+    ws_ms = trade.get("window_start_ms")
+    start_ts = (float(ws_ms) / 1000.0) if ws_ms else (end_ts - settings.CANDLE_WINDOW_MINUTES * 60.0)
+    tol = _ps_tol()
+    opened = polybolt_feed.twap_at(start_ts, tol)
+    if opened is None and trade.get("strike_source") == "polymarket_twap":
+        opened = trade.get("strike_price")
+    closed = polybolt_feed.twap_at(end_ts, tol)
+    if opened is None or closed is None or opened <= 0 or closed <= 0:
+        return None
+    # POB-main resolution rule: up_won = 1.0 if settle > strike else 0.0
+    return (closed > opened), opened, closed
 
 polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
     ws_url=settings.POLYMARKET_LIVE_DATA_WS_URL,
-    symbol_includes=get_ws_symbol_filter(settings.SYMBOL)
+    symbol_includes=get_ws_symbol_filter(settings.SYMBOL),
+    on_update=_on_chainlink_tick
 )
 polymarket_clob_ws = ws_data.PolymarketClobMarketStream()
-chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL))
+chainlink_ws_stream = ws_data.ChainlinkPriceStream(
+    aggregator=settings.get_aggregator(settings.SYMBOL),
+    on_update=_on_chainlink_tick
+)
 
 def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
     now_ms = time.time() * 1000
@@ -408,9 +471,12 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
     up_ws = polymarket_clob_ws.get_token_market(up_token_id)
     down_ws = polymarket_clob_ws.get_token_market(down_token_id)
 
-    # Use WS best_ask if available, else fallback to REST
+    # Use WS best_ask if available (with POB-main 1.0 - up_bid complement fallback for DOWN), else fallback to REST
     up_buy = up_ws.get("best_ask")
+    up_bid = up_ws.get("best_bid")
     down_buy = down_ws.get("best_ask")
+    if down_buy is None and up_bid is not None and 0.0 < float(up_bid) < 1.0:
+        down_buy = round(1.0 - float(up_bid), 6)
 
     if up_buy is None or down_buy is None:
         try:
@@ -446,6 +512,11 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
             if not down_book_summary:
                 down_book_summary = {"bestBid": None, "bestAsk": down_buy, "spread": None, "bidLiquidity": None, "askLiquidity": None}
 
+    if down_buy is None and up_book_summary and up_book_summary.get("bestBid") and 0.0 < float(up_book_summary["bestBid"]) < 1.0:
+        down_buy = round(1.0 - float(up_book_summary["bestBid"]), 6)
+    if down_book_summary and not down_book_summary.get("askLiquidity") and up_book_summary and up_book_summary.get("bidLiquidity"):
+        down_book_summary["askLiquidity"] = up_book_summary["bidLiquidity"]
+
     # Track whether the book data came from WS or REST
     book_source = "ws" if ((up_ws.get("bids") or up_ws.get("asks")) and (down_ws.get("bids") or down_ws.get("asks"))) else "rest"
 
@@ -480,329 +551,127 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
         "book_source": book_source
     }
 
-async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, Any], token_ids: Dict[str, Any], evaluated_price: Optional[float] = None):
-    """
-    Continuous FOK Fill Loop (Worker):
-    Continuously attempts to fill the live position via Polymarket CLOB Market FOK orders.
-    - Zero-latency: uses precomputed live balance & stake from RAM (0ms RPC overhead).
-    - Tight retry interval (COPY_RETRY_INTERVAL_MS, 50-200ms).
-    - Progressive slippage sweeping: increases limit price slightly with each attempt to guarantee fill.
-    - Halts on expiry (<COPY_MIN_REMAINING_S), max attempts (3), or successful fill.
-    """
-    cur_mkt_id = str(market.get("id")) if market.get("id") else ""
-    cur_slug = market.get("slug") or ""
-    side = trade["side"]
-    token_id = token_ids.get("up") if side == "UP" else token_ids.get("down")
-    trade["token_id"] = token_id
-
-    if not token_id:
-        trade["live_status"] = "FAILED"
-        log_message(f"LIVE copy aborted: missing token_id for {side}")
-        _in_flight_markets.discard(cur_mkt_id)
-        _in_flight_markets.discard(cur_slug)
-        return
-
-    log_message(f"LIVE copy started for {trade['market_slug']} ({side}) — continuous FOK fill loop initiated")
-    retry_interval = max(0.05, min(0.20, settings.COPY_RETRY_INTERVAL_MS / 1000.0))
-    max_attempts = 3
-
-    try:
-        while trade["status"] == "OPEN" and trade.get("live_status") == "FILLING":
-            now_ts = time.time()
-            # 1. Check if window is close to expiry (<COPY_MIN_REMAINING_S)
-            if trade.get("end_ts") and (trade["end_ts"] - now_ts) < settings.COPY_MIN_REMAINING_S:
-                trade["live_status"] = "TIMEOUT"
-                log_message(f"LIVE copy stopped for {trade['market_slug']}: window close to expiry (<{settings.COPY_MIN_REMAINING_S}s)")
-                await asyncio.to_thread(save_state)
-                _sync_active_trades_to_latest_data()
-                await broadcast_state()
-                break
-
-            attempt_num = trade.get("live_attempts", 0) + 1
-            trade["live_attempts"] = attempt_num
-
-            if attempt_num > max_attempts:
-                trade["live_status"] = "TIMEOUT"
-                log_message(f"LIVE copy max attempts reached ({max_attempts}) for {trade['market_slug']} — halting to prevent duplicate orders")
-                await asyncio.to_thread(save_state)
-                _sync_active_trades_to_latest_data()
-                await broadcast_state()
-                break
-
-            # 2. Get freshest book ask for this token (attempt #1 uses evaluated_price instantly with 0ms RAM lookup)
-            if attempt_num == 1 and evaluated_price and evaluated_price > 0:
-                current_ask = evaluated_price
-            else:
-                summary = polymarket_clob_ws.get_summary(token_id, max_age_s=3.0)
-                current_ask = summary.get("bestAsk") if summary else None
-                if not current_ask or current_ask <= 0:
-                    current_ask = evaluated_price or trade.get("paper_entry_price") or trade.get("entry_price") or 0.50
-
-            # 3. Sizing: Instant RAM lookup of precomputed stake from background updater (0ms latency)
-            live_balance = state.get("live_balance") or 0.0
-            live_amount = state.get("precomputed_live_stake") or 0.0
-
-            # Safety fallback if background updater hasn't populated yet
-            if live_balance <= 0 or live_amount <= 0:
-                live_balance = await asyncio.to_thread(clob_trader.get_usdc_balance) or 0.0
-                state["live_balance"] = live_balance
-                risk_type = (settings.RISK_TYPE or "percent").lower()
-                if risk_type == "fixed":
-                    live_amount = float(settings.RISK_VALUE)
-                else:
-                    live_amount = (float(settings.RISK_VALUE) / 100.0) * live_balance
-                live_amount = max(1.0, min(live_amount, live_balance)) if live_balance >= 1.0 else 0.0
-                state["precomputed_live_stake"] = round(live_amount, 2)
-
-            if live_balance < 1.0 or live_amount < 1.0:
-                trade["live_status"] = "INSUFFICIENT_FUNDS"
-                log_message(f"LIVE copy halted for {trade['market_slug']}: deposit balance too low (${live_balance:.2f} < $1.00 minimum)")
-                await asyncio.to_thread(save_state)
-                _sync_active_trades_to_latest_data()
-                await broadcast_state()
-                break
-
-            # 4. Place FOK market BUY order with persistent progressive sweep
-            extra_slip = min(0.08, (attempt_num - 1) * 0.015)
-            effective_slip = settings.CLOB_MAX_SLIPPAGE + extra_slip
-
-            res = await asyncio.to_thread(clob_trader.place_market_buy, token_id, live_amount, current_ask, slippage=effective_slip)
-
-            if res.get("ok") and res.get("fill_size"):
-                # FILLED via FOK!
-                trade["live_status"] = "FILLED"
-                fill_size = float(res["fill_size"])
-                fill_price = float(res["fill_price"])
-                fill_usd = float(res.get("fill_usd") or (fill_size * fill_price))
-                trade["live_entry_price"] = fill_price
-                trade["live_shares"] = fill_size
-                trade["live_amount"] = fill_usd
-                trade["live_entry_time"] = datetime.now().isoformat()
-                trade["live_order_id"] = res.get("order_id")
-                trade["live_quoted_price"] = current_ask
-                trade["live_slippage"] = fill_price - current_ask
-
-                # Populate legacy top-level fields for backwards compatibility
-                trade["shares"] = fill_size
-                trade["entry_price"] = fill_price
-                trade["amount"] = fill_usd
-                trade["order_id"] = res.get("order_id")
-
-                # Immediately deduct spent funds in RAM so subsequent orders don't wait for chain sync
-                if fill_usd > 0:
-                    new_bal = max(0.0, (state.get("live_balance") or 0.0) - fill_usd)
-                    state["live_balance"] = new_bal
-                    risk_type = (settings.RISK_TYPE or "percent").lower()
-                    if risk_type == "fixed":
-                        new_stake = float(settings.RISK_VALUE)
-                    else:
-                        new_stake = (float(settings.RISK_VALUE) / 100.0) * new_bal
-                    state["precomputed_live_stake"] = round(max(1.0, min(new_stake, new_bal)) if new_bal >= 1.0 else 0.0, 2)
-
-                save_state()
-                _sync_active_trades_to_latest_data()
-                await broadcast_state()
-
-                msg = (f"LIVE trade FILLED (attempt #{attempt_num}): {side} ${fill_usd:.2f} on {trade['market_slug']} "
-                       f"— {fill_size:.2f} shares @ {fill_price:.4f} (paper entry {trade.get('paper_entry_price', trade.get('entry_price', 0)):.4f}, order {trade['live_order_id']})")
-                log_message(msg)
-                log_message(f"Confirmed: Trade OPENED on both PAPER (${trade.get('paper_amount', 0):.2f}) and LIVE (${fill_usd:.2f})!")
-                await send_telegram(f"🚀 *LIVE Copy FILLED (Attempt #{attempt_num})*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}` (Paper: `{trade.get('paper_entry_price', trade.get('entry_price', 0)):.4f}`)\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
-                return
-            else:
-                err = res.get("error", "unfilled")
-                if any(k in str(err) for k in ("setup_failed", "client_not_ready", "invalid_private_key", "not enough balance", "balance is not enough")):
-                    trade["live_status"] = "FAILED"
-                    log_message(f"LIVE copy aborted: {err}")
-                    save_state()
-                    _sync_active_trades_to_latest_data()
-                    await broadcast_state()
-                    return
-
-                log_message(f"LIVE copy attempt #{attempt_num} for {side} @ {current_ask:.4f} [FOK]: {err} - retrying FOK in {int(retry_interval * 1000)}ms until opened...")
-
-            await asyncio.sleep(retry_interval)
-    finally:
-        _in_flight_markets.discard(cur_mkt_id)
-        _in_flight_markets.discard(cur_slug)
-
-
 async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], strike_open: Optional[float], token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None,
                         strike_source: str = "chainlink_ws", window_start_ms: Optional[int] = None,
                         open_reason: str = "ev_entry"):
     if decision["action"] != "ENTER":
         return decision.get("reason", "no_trade")
 
-    async with _trade_lock:
-        cur_mkt_id = str(market.get("id")) if market.get("id") else ""
-        cur_slug = market.get("slug") or ""
+    # CONSTRAINT: Only one position per market window — do NOT block entering a new window while an old one is resolving
+    cur_mkt_id = str(market.get("id"))
+    if any(str(t.get("market_id")) == cur_mkt_id for t in state["active_trades"]):
+        return "slot_busy"
 
-        # Concurrency & In-flight check
-        if cur_mkt_id and cur_mkt_id in _in_flight_markets:
-            return "slot_busy"
-        if cur_slug and cur_slug in _in_flight_markets:
-            return "slot_busy"
+    if state["withdraw_state"] == "in_progress":
+        return "withdraw_in_progress"
 
-        # CONSTRAINT: Only one position per market window
-        for t in state["active_trades"]:
-            if cur_mkt_id and str(t.get("market_id")) == cur_mkt_id:
-                return "slot_busy"
-            if cur_slug and t.get("market_slug") == cur_slug:
-                return "slot_busy"
-            if window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms):
-                return "slot_busy"
+    if strike_open is None:
+        return "no_strike"
 
-        # STRICT LOCKOUT: Never re-enter THIS window if it was already executed
-        if cur_mkt_id in _executed_windows or cur_slug in _executed_windows or (window_start_ms and str(window_start_ms) in _executed_windows):
-            return "slot_already_executed"
+    side = decision["side"]
+    price = market_prices["up"] if side == "UP" else market_prices["down"]
+    if price is None:
+        return "no_price"
 
-        for t in state.get("trade_history", []):
-            if cur_slug and t.get("market_slug") == cur_slug:
-                return "slot_already_executed"
-            if cur_mkt_id and str(t.get("market_id")) == cur_mkt_id:
-                return "slot_already_executed"
-            if window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms):
-                return "slot_already_executed"
+    balance = state["paper_balance"]
+    risk_type = (settings.RISK_TYPE or "percent").lower()
+    if risk_type == "fixed":
+        amount_to_risk = float(settings.RISK_VALUE)
+    else:
+        amount_to_risk = (float(settings.RISK_VALUE) / 100.0) * balance
 
-        if state["withdraw_state"] == "in_progress":
-            return "withdraw_in_progress"
+    if amount_to_risk <= 0:
+        return "stake_zero"
 
-        if strike_open is None:
-            return "no_strike"
+    ob = (orderbook or {}).get("up" if side == "UP" else "down") or {}
+    ask_liq_shares = ob.get("askLiquidity")
+    if ask_liq_shares is not None and price > 0:
+        ask_liq_usd = ask_liq_shares * price
+        if ask_liq_usd < settings.MIN_BOOK_LIQUIDITY_USD:
+            log_message(f"Skip {side}: thin book (${ask_liq_usd:.2f} ask liquidity)")
+            return "thin_book"
+        amount_to_risk = min(amount_to_risk, ask_liq_usd)
 
-        side = decision["side"]
-        price = market_prices["up"] if side == "UP" else market_prices["down"]
-        if price is None:
-            return "no_price"
+    if balance < amount_to_risk or amount_to_risk <= 0:
+        print(f"Insufficient balance ({balance}) or invalid risk amount ({amount_to_risk})")
+        return "insufficient_balance"
 
-        # Internal paper balance risk sizing
-        balance = state["paper_balance"]
-        risk_type = (settings.RISK_TYPE or "percent").lower()
-        if risk_type == "fixed":
-            paper_amount = float(settings.RISK_VALUE)
-        else:
-            paper_amount = (float(settings.RISK_VALUE) / 100.0) * balance
-
-        if paper_amount <= 0:
-            return "stake_zero"
-
-        ob = (orderbook or {}).get("up" if side == "UP" else "down") or {}
-        ask_liq_shares = ob.get("askLiquidity")
-        if ask_liq_shares is not None and price > 0:
-            ask_liq_usd = ask_liq_shares * price
-            min_needed = max(1.0, min(paper_amount, 5.0))
-            if ask_liq_usd < min_needed and ask_liq_usd < settings.MIN_BOOK_LIQUIDITY_USD:
-                log_message(f"Skip {side}: thin book (${ask_liq_usd:.2f} ask liquidity < ${min_needed:.2f} needed)")
-                return "thin_book"
-            paper_amount = min(paper_amount, ask_liq_usd)
-
-        if balance < paper_amount or paper_amount <= 0:
-            print(f"Insufficient internal paper balance ({balance})")
-            return "insufficient_balance"
-
-        end_date_str = market.get("endDate")
-        end_ts = 0
-        if end_date_str:
-            try:
-                end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
-            except Exception:
-                pass
-        if not end_ts:
-            end_ts = time.time() + settings.CANDLE_WINDOW_MINUTES * 60
-
-        token_id = token_ids.get("up") if side == "UP" else token_ids.get("down")
-        trade_id = f"{cur_mkt_id}_{int(time.time() * 1000)}"
-
-        trade = {
-            "trade_id": trade_id,
-            "market_id": market["id"],
-            "market_slug": market.get("slug"),
-            "side": side,
-            "token_id": token_id,
-
-            # ── Paper execution (immediate) ──────────────────────────────────
-            "paper_entry_price": price,
-            "paper_amount": paper_amount,
-            "paper_shares": paper_amount / price,
-            "paper_entry_time": datetime.now().isoformat(),
-            "paper_close_price": None,
-            "paper_closed_time": None,
-            "paper_profit_loss": None,
-
-            # Legacy generic fields for UI/dashboard backward compatibility
-            "entry_price": price,
-            "amount": paper_amount,
-            "shares": paper_amount / price,
-            "entry_time": datetime.now().isoformat(),
-            "close_price": None,
-            "profit_loss": None,
-
-            # ── Live execution (continuous FOK copy worker) ───────────────────
-            "live_status": "FILLING" if settings.PRIVATE_KEY else "NO_CREDS",
-            "live_attempts": 0,
-            "live_entry_price": None,
-            "live_amount": None,
-            "live_shares": None,
-            "live_entry_time": None,
-            "live_order_id": None,
-            "live_mark_price": None,
-            "live_unrealized_pl": None,
-            "live_close_price": None,
-            "live_closed_time": None,
-            "live_profit_loss": None,
-
-            # ── Lifecycle ───────────────────────────────────────────────────
-            "status": "OPEN",
-            "awaiting_resolution": False,
-            "strike_price": strike_open,
-            "strike_source": strike_source,
-            "window_start_ms": int(window_start_ms) if window_start_ms is not None else None,
-            "open_reason": open_reason,
-            "end_ts": end_ts,
-            "mode": "hybrid" if settings.PRIVATE_KEY else "paper"
-        }
-
-        if cur_mkt_id:
-            _in_flight_markets.add(cur_mkt_id)
-        if cur_slug:
-            _in_flight_markets.add(cur_slug)
-
-        trade_dispatched = False
+    end_date_str = market.get("endDate")
+    end_ts = 0
+    if end_date_str:
         try:
-            state["paper_balance"] -= paper_amount
+            end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
+        except Exception:
+            pass
+    if not end_ts:
+        end_ts = time.time() + settings.CANDLE_WINDOW_MINUTES * 60
+
+    shares = amount_to_risk / price
+    entry_fee = (shares * settings.FEE_RATE * price * (1.0 - price)) if settings.FEES_ENABLED else 0.0
+
+    trade = {
+        "market_id": market["id"],
+        "market_slug": market.get("slug"),
+        "side": side,
+        "entry_price": price,
+        "amount": amount_to_risk,
+        "shares": shares,
+        "fee": entry_fee,
+        "entry_time": datetime.now().isoformat(),
+        "status": "OPEN",
+        "settlement_price": None,
+        "profit_loss": None,
+        "strike_price": strike_open,
+        "strike_source": strike_source,
+        "window_start_ms": int(window_start_ms) if window_start_ms is not None else None,
+        "open_reason": open_reason,
+        "close_price": None,
+        "end_ts": end_ts,
+        "mode": state["trading_mode"]
+    }
+
+    if state["trading_mode"] == "paper":
+        state["paper_balance"] -= (amount_to_risk + entry_fee)
+        state["active_trades"].append(trade)
+        state["last_trade_side"] = side
+        save_state()
+
+        msg = f"Executed PAPER trade: {side} @ {price:.4f} for {market.get('slug')} (Stake: ${amount_to_risk:.2f}, Fee: ${entry_fee:.2f})"
+        log_message(msg)
+        await send_telegram(f"🟢 *PAPER Trade Entered*\n• Side: `{side}`\n• Price: `{price:.4f}`\n• Stake: `${amount_to_risk:.2f}` (Fee: `${entry_fee:.2f}`)\n• Market: `{market.get('slug')}`")
+        return "entered"
+    else:
+        token_id = token_ids.get("up") if side == "UP" else token_ids.get("down")
+        if not token_id:
+            log_message(f"LIVE trade aborted: missing token_id for side {side}")
+            return "missing_token_id"
+
+        result = await asyncio.to_thread(clob_trader.place_market_buy, token_id, amount_to_risk, price)
+        if result.get("ok"):
+            trade["order_id"] = result.get("order_id")
+            trade["order_response"] = result.get("response") or {}
+            trade["token_id"] = token_id
+            fill_size = result.get("fill_size")
+            fill_price = result.get("fill_price")
+            fill_usd = result.get("fill_usd")
+            if fill_size and fill_price:
+                trade["shares"] = float(fill_size)
+                trade["entry_price"] = float(fill_price)
+                trade["amount"] = float(fill_usd if fill_usd else fill_size * fill_price)
+                trade["quoted_price"] = price
+                trade["slippage"] = float(fill_price) - float(price) if price else None
             state["active_trades"].append(trade)
-            if cur_mkt_id: _executed_windows.add(cur_mkt_id)
-            if cur_slug: _executed_windows.add(cur_slug)
-            if window_start_ms: _executed_windows.add(str(window_start_ms))
             state["last_trade_side"] = side
-            _sync_active_trades_to_latest_data()
-
-            msg = f"Executed PAPER trade: {side} @ {price:.4f} for {market.get('slug')} (Amount: ${paper_amount:.2f})"
+            save_state()
+            fak_tag = " [FAK Fallback]" if result.get("fallback_fak") else ""
+            msg = (f"Executed LIVE trade{fak_tag}: {side} ${trade['amount']:.2f} on {market.get('slug')} "
+                   f"— {trade['shares']:.2f} shares @ {trade['entry_price']:.4f} (quote {price}, order {trade['order_id']})")
             log_message(msg)
-
-            # Parallel dispatch: Never wait for Paper disk writes or Telegram alerts before firing Live!
-            async def _bg_paper_post_actions():
-                await asyncio.to_thread(save_state)
-                await send_telegram(f"🟢 *PAPER Trade Entered*\n• Side: `{side}`\n• Price: `{price:.4f}`\n• Stake: `${paper_amount:.2f}`\n• Market: `{market.get('slug')}`")
-
-            if settings.PRIVATE_KEY:
-                # Fire LIVE trade order and paper background tasks concurrently via asyncio.gather
-                trade_dispatched = True
-                asyncio.create_task(asyncio.gather(
-                    _continuous_live_copy_fill(trade, market, token_ids, evaluated_price=price),
-                    _bg_paper_post_actions()
-                ))
-            else:
-                log_message("LIVE copy skipped: no private key set in settings")
-                asyncio.create_task(_bg_paper_post_actions())
-
+            await send_telegram(f"🚀 *LIVE Trade Entered{fak_tag}*\n• Side: `{side}`\n• Price: `{trade['entry_price']:.4f}`\n• Shares: `{trade['shares']:.2f}`\n• Amount: `${trade['amount']:.2f}`\n• Market: `{market.get('slug')}`")
             return "entered"
-        finally:
-            if not trade_dispatched:
-                if cur_mkt_id:
-                    _in_flight_markets.discard(cur_mkt_id)
-                if cur_slug:
-                    _in_flight_markets.discard(cur_slug)
+        else:
+            log_message(f"LIVE trade FAILED ({side}): {result.get('error')}")
+            return "live_order_failed"
 
 async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str, Any], time_left_min: Optional[float]):
     if not settings.FLIP_ENABLED:
@@ -865,7 +734,7 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
 
 def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[float],
                       spot_price: Optional[float], price_source: Optional[str],
-                      price_is_fresh: bool = True) -> Dict[str, Any]:
+                      price_is_fresh: bool = True, price_ts_ms: Optional[float] = None) -> Dict[str, Any]:
     opens = state["market_opens"]
     prev_ws = state.get("last_window_start")
 
@@ -886,13 +755,17 @@ def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[floa
 
     win = opens[start_ms]
     since_start = time.time() * 1000 - start_ms
-    if (win["chainlink"] is None and current_price and price_is_fresh
+    ts_ok = price_ts_ms is None or price_ts_ms >= start_ms or since_start >= STRIKE_WAIT_MS
+    if (win["chainlink"] is None and current_price and price_is_fresh and ts_ok
             and 0 <= since_start < MARK_CAPTURE_WINDOW_MS):
         win["chainlink"] = current_price
         win["binance"] = spot_price
         win["genuine"] = True
-        log_message(f"Window open marked @ eventStartTime: Chainlink {current_price:.2f} "
-                    f"({price_source}) / Binance {spot_price if spot_price else '-'}")
+        log_message(f"Window open marked @ eventStartTime: Chainlink {current_price:.2f} ({price_source})")
+    elif win["chainlink"] is None and since_start >= MARK_CAPTURE_WINDOW_MS:
+        if not win.get("skip_logged"):
+            win["skip_logged"] = True
+            log_message("Window open not captured (started late mid-window): No strike @ eventStartTime — waiting for PolyBolt TWAP or next window")
     state["last_window_start"] = start_ms
     return win
 
@@ -955,55 +828,6 @@ async def update_trades(current_prices: Dict[str, Any]):
             if frozen_close:
                 trade["close_price"] = frozen_close
 
-        # End-of-window wallet fill reconciliation:
-        # Before evaluating settlement, compare wallet's actual fills with bot records.
-        # This catches any ghost fills or orders that filled without local confirmation.
-        if expired and trade.get("live_status") != "FILLED" and clob_trader.is_ready() and not trade.get("_reconciled"):
-            trade["_reconciled"] = True
-            token_id = trade.get("token_id")
-            order_id = trade.get("live_order_id") or trade.get("order_id")
-            reconciled_fills = []
-            if order_id:
-                reconciled_fills = await asyncio.to_thread(clob_trader.get_order_fills, order_id, token_id)
-            if not reconciled_fills and token_id:
-                try:
-                    entry_str = trade.get("live_entry_time") or trade.get("paper_entry_time") or trade.get("entry_time")
-                    start_ts = datetime.fromisoformat(entry_str).timestamp()
-                except Exception:
-                    start_ts = end_ts - (settings.CANDLE_WINDOW_MINUTES * 60)
-                reconciled_fills = await asyncio.to_thread(clob_trader.get_token_fills_in_window, token_id, start_ts, end_ts)
-
-            if reconciled_fills:
-                total_shares = sum(float(f["size"]) for f in reconciled_fills)
-                total_usd = sum(float(f["size"]) * float(f["price"]) for f in reconciled_fills)
-                avg_price = total_usd / total_shares if total_shares > 0 else float(trade.get("paper_entry_price") or trade.get("entry_price") or 0.5)
-
-                log_message(f"WALLET RECONCILIATION: Discovered {total_shares:.2f} filled shares in wallet for {trade['market_slug']} ({trade['side']}) — reconciling trade to FILLED!")
-                trade["live_status"] = "FILLED"
-                trade["live_shares"] = total_shares
-                trade["live_entry_price"] = avg_price
-                trade["live_amount"] = total_usd
-                trade["shares"] = total_shares
-                trade["amount"] = total_usd
-                trade["entry_price"] = avg_price
-                trade["live_entry_time"] = trade.get("live_entry_time") or datetime.now().isoformat()
-
-                # Deduct spent funds in RAM
-                if total_usd > 0:
-                    new_bal = max(0.0, (state.get("live_balance") or 0.0) - total_usd)
-                    state["live_balance"] = new_bal
-                    risk_type = (settings.RISK_TYPE or "percent").lower()
-                    if risk_type == "fixed":
-                        new_stake = float(settings.RISK_VALUE)
-                    else:
-                        new_stake = (float(settings.RISK_VALUE) / 100.0) * new_bal
-                    state["precomputed_live_stake"] = round(max(1.0, min(new_stake, new_bal)) if new_bal >= 1.0 else 0.0, 2)
-
-                save_state()
-                _sync_active_trades_to_latest_data()
-                await broadcast_state()
-                trades_changed = True
-
         market = trade.get("_market")
         poll_every = 3.0 if expired else 30.0
         if trade.get("last_api_check", 0) < now_ts - poll_every:
@@ -1053,17 +877,26 @@ async def update_trades(current_prices: Dict[str, Any]):
         settlement_price = (trade.get("close_price") or trade.get("settlement_price_at_expiry")
                             or trade.get("last_price") or cur_price)
         if winning_index == -1 and (expired or market_closed):
-            if trade.get("expired_at") is None:
-                trade["expired_at"] = now_ts
-            waited = now_ts - trade["expired_at"]
-            if waited < settings.AUTHORITATIVE_SETTLE_WAIT_S and not market_closed:
-                remaining_active.append(trade)
-                continue
-            if strike and settlement_price:
+            _pt = _ps_settle_call(trade)
+            if _pt is not None:
+                _up_won, strike, settlement_price = _pt
+                trade["strike_price"] = strike
+                trade["close_price"] = settlement_price
                 trade["settlement_price_at_expiry"] = settlement_price
-                winning_index = up_index if settlement_price > strike else down_index
-                resolution = "close_vs_open"
-                trade["settle_wait_s"] = round(waited, 1)
+                winning_index = up_index if _up_won else down_index
+                resolution = "polymarket_twap"
+            else:
+                if trade.get("expired_at") is None:
+                    trade["expired_at"] = now_ts
+                waited = now_ts - trade["expired_at"]
+                if waited < settings.AUTHORITATIVE_SETTLE_WAIT_S and not market_closed:
+                    remaining_active.append(trade)
+                    continue
+                if strike and settlement_price:
+                    trade["settlement_price_at_expiry"] = settlement_price
+                    winning_index = up_index if settlement_price > strike else down_index
+                    resolution = "close_vs_open"
+                    trade["settle_wait_s"] = round(waited, 1)
 
         if winning_index == -1:
             first_seen = trade.get("unresolved_since")
@@ -1076,17 +909,13 @@ async def update_trades(current_prices: Dict[str, Any]):
                 continue
             trade["status"] = "VOID"
             trade["exit_reason"] = "void"
-            now_iso = datetime.now().isoformat()
-            trade["exit_time"] = now_iso
-            trade["paper_closed_time"] = now_iso
-            trade["live_closed_time"] = now_iso if trade.get("live_status") == "FILLED" else None
-            trade["paper_profit_loss"] = 0.0
-            trade["live_profit_loss"] = 0.0 if trade.get("live_status") == "FILLED" else None
+            trade["exit_time"] = datetime.now().isoformat()
             trade["profit_loss"] = 0.0
-            state["paper_balance"] += float(trade.get("paper_amount") or trade.get("amount") or 0.0)
+            if trade.get("mode", "paper") == "paper":
+                state["paper_balance"] += trade["amount"]
             state["trade_history"].append(_archive(trade))
             trades_changed = True
-            log_message(f"VOID: Trade for {trade['market_slug']} unresolved past grace; stake refunded.")
+            log_message(f"VOID: Trade for {trade['market_slug']} unresolved past grace; stake refunded (paper).")
             continue
 
         won = ((trade["side"] == "UP" and winning_index == up_index) or
@@ -1096,8 +925,6 @@ async def update_trades(current_prices: Dict[str, Any]):
         close_px = trade.get("close_price") or settlement_price
         trade["open_price"] = open_px
         trade["close_price"] = close_px
-        trade["paper_close_price"] = close_px
-        trade["live_close_price"] = close_px if trade.get("live_status") == "FILLED" else None
         trade["resolution"] = resolution or "unknown"
         if open_px and close_px:
             move_side = "UP" if close_px > open_px else "DOWN"
@@ -1105,60 +932,22 @@ async def update_trades(current_prices: Dict[str, Any]):
         else:
             dir_txt = f"open {open_px} -> close {close_px}"
 
-        now_iso = datetime.now().isoformat()
-        trade["paper_closed_time"] = now_iso
-        trade["live_closed_time"] = now_iso if trade.get("live_status") in ("FILLED", "FILLING") else None
-        if trade.get("live_status") == "FILLING":
-            trade["live_status"] = "TIMEOUT"
-
+        fee_paid = float(trade.get("fee") or 0.0)
         if won:
-            # Paper payout
-            paper_shares = float(trade.get("paper_shares") or trade.get("shares") or 0.0)
-            paper_amt = float(trade.get("paper_amount") or trade.get("amount") or 0.0)
-            paper_payout = paper_shares * 1.0
-            state["paper_balance"] += paper_payout
-            trade["paper_profit_loss"] = paper_payout - paper_amt
-            trade["profit_loss"] = trade["paper_profit_loss"]
-            state["consecutive_losses"] = 0
-
-            # Live payout
-            if trade.get("live_status") == "FILLED" and trade.get("live_shares"):
-                live_shares = float(trade["live_shares"])
-                live_amt = float(trade.get("live_amount") or 0.0)
-                live_payout = live_shares * 1.0
-                trade["live_profit_loss"] = live_payout - live_amt
-                log_message(f"WIN: {trade['side']} on {trade['market_slug']}: {dir_txt} "
-                            f"[{trade['resolution']}]. Live Profit: ${trade['live_profit_loss']:.2f} (Paper Profit: ${trade['paper_profit_loss']:.2f})")
-                await send_telegram(f"🏆 *WIN: {trade['side']}*\n• Live Profit: `+${trade['live_profit_loss']:.2f}`\n• Details: {dir_txt}\n• Market: `{trade['market_slug']}`")
+            payout = trade["shares"] * 1.0
+            if trade.get("mode", "paper") == "paper":
+                state["paper_balance"] += payout
+            trade["profit_loss"] = payout - trade["amount"] - fee_paid
+            log_message(f"WIN: {trade['side']} on {trade['market_slug']}: {dir_txt} "
+                        f"[{trade['resolution']}]. Profit: ${trade['profit_loss']:.2f}")
+            await send_telegram(f"🏆 *WIN: {trade['side']}*\n• Profit: `+${trade['profit_loss']:.2f}`\n• Details: {dir_txt}\n• Market: `{trade['market_slug']}`")
+            if trade.get("mode") == "live":
                 await _redeem_win(trade, market, up_index, down_index, winning_index)
-            else:
-                trade["live_profit_loss"] = None
-                log_message(f"WIN (Paper): {trade['side']} on {trade['market_slug']}: {dir_txt} "
-                            f"[{trade['resolution']}]. Paper Profit: ${trade['paper_profit_loss']:.2f}")
-                await send_telegram(f"🏆 *WIN (Paper): {trade['side']}*\n• Paper Profit: `+${trade['paper_profit_loss']:.2f}`\n• Details: {dir_txt}\n• Market: `{trade['market_slug']}`")
         else:
-            paper_amt = float(trade.get("paper_amount") or trade.get("amount") or 0.0)
-            trade["paper_profit_loss"] = -paper_amt
-            trade["profit_loss"] = -paper_amt
-            state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
-            if state["consecutive_losses"] >= settings.CIRCUIT_BREAKER_LOSSES:
-                pause_ms = settings.PAUSE_MARKETS * 15 * 60 * 1000
-                state["cb_pause_until_ms"] = int(time.time() * 1000 + pause_ms)
-                pause_mins = settings.PAUSE_MARKETS * 15
-                log_message(f"⚠️ CIRCUIT BREAKER TRIGGERED: {state['consecutive_losses']} consecutive losses. Pausing entries for {pause_mins}m ({settings.PAUSE_MARKETS} markets).")
-                await send_telegram(f"⚠️ *CIRCUIT BREAKER TRIGGERED*\n• {state['consecutive_losses']} consecutive losses reached.\n• Pausing new entries for `{pause_mins} minutes` ({settings.PAUSE_MARKETS} markets).")
-
-            if trade.get("live_status") == "FILLED" and trade.get("live_shares"):
-                live_amt = float(trade.get("live_amount") or 0.0)
-                trade["live_profit_loss"] = -live_amt
-                log_message(f"LOSS: {trade['side']} on {trade['market_slug']}: {dir_txt} "
-                            f"[{trade['resolution']}]. Live Loss: ${trade['live_profit_loss']:.2f} (Paper Loss: -${paper_amt:.2f})")
-                await send_telegram(f"❌ *LOSS: {trade['side']}*\n• Live Loss: `-${live_amt:.2f}`\n• Details: {dir_txt}\n• Market: `{trade['market_slug']}`")
-            else:
-                trade["live_profit_loss"] = None
-                log_message(f"LOSS (Paper): {trade['side']} on {trade['market_slug']}: {dir_txt} "
-                            f"[{trade['resolution']}]. Paper Loss: -${paper_amt:.2f}")
-                await send_telegram(f"❌ *LOSS (Paper): {trade['side']}*\n• Paper Loss: `-${paper_amt:.2f}`\n• Details: {dir_txt}\n• Market: `{trade['market_slug']}`")
+            trade["profit_loss"] = -trade["amount"] - fee_paid
+            log_message(f"LOSS: {trade['side']} on {trade['market_slug']}: {dir_txt} "
+                        f"[{trade['resolution']}]. Loss: ${trade['profit_loss']:.2f}")
+            await send_telegram(f"❌ *LOSS: {trade['side']}*\n• Loss: `-${abs(trade['profit_loss']):.2f}`\n• Details: {dir_txt}\n• Market: `{trade['market_slug']}`")
 
         trade["status"] = "CLOSED"
         trade["exit_reason"] = trade.get("exit_reason") or "settled"
@@ -1171,9 +960,6 @@ async def update_trades(current_prices: Dict[str, Any]):
     state["active_trades"] = remaining_active
     if trades_changed:
         save_state()
-        _sync_active_trades_to_latest_data()
-        import gc
-        gc.collect()
 
 # ── Capital Extractor (Auto-Withdrawal State Machine) ─────────────────────────
 async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
@@ -1257,49 +1043,8 @@ def entry_block_reason(ctx: Dict[str, Any]) -> Optional[str]:
         return "stopped"
     if state["withdraw_state"] == "in_progress":
         return "withdraw_in_progress"
-
-    # ── Stage 7 Defense: Circuit Breaker ──────────────────────────────────────
-    now_ms = time.time() * 1000
-    if now_ms < state.get("cb_pause_until_ms", 0):
-        rem_s = int((state["cb_pause_until_ms"] - now_ms) / 1000)
-        return f"circuit_breaker_active ({rem_s}s left)"
-
-    # ── Stage 7 Defense: Transition Hours (18, 23 UTC) ────────────────────────
-    now_utc_hour = datetime.now(timezone.utc).hour
-    if now_utc_hour in settings.SKIP_HOURS_UTC:
-        return f"skip_hour_active ({now_utc_hour:02d}:00 UTC)"
-
     if not ctx:
         return "no_context"
-    _mkt = ctx.get("market") or {}
-    _mid = str(_mkt.get("id") or "")
-    _mslug = str(_mkt.get("slug") or "")
-    _sms = ctx.get("start_ms")
-
-    # In-flight check for this market
-    if (_mid and _mid in _in_flight_markets) or (_mslug and _mslug in _in_flight_markets):
-        return "slot_busy"
-
-    # Check if THIS specific window is already busy in active_trades
-    for t in state["active_trades"]:
-        if _mid and str(t.get("market_id")) == _mid:
-            return "slot_busy"
-        if _mslug and t.get("market_slug") == _mslug:
-            return "slot_busy"
-        if _sms is not None and t.get("window_start_ms") == int(_sms):
-            return "slot_busy"
-
-    # Strict Lockout: check if THIS specific window was already executed
-    if _mid in _executed_windows or _mslug in _executed_windows or (_sms and str(_sms) in _executed_windows):
-        return "slot_already_executed"
-    for _ht in state.get("trade_history", []):
-        if _mslug and _ht.get("market_slug") == _mslug:
-            return "slot_already_executed"
-        if _mid and str(_ht.get("market_id")) == _mid:
-            return "slot_already_executed"
-        if _sms is not None and _ht.get("window_start_ms") == int(_sms):
-            return "slot_already_executed"
-
     if ctx.get("slot_busy"):
         return "slot_busy"
     if not ctx.get("price_is_fresh"):
@@ -1308,20 +1053,6 @@ def entry_block_reason(ctx: Dict[str, Any]) -> Optional[str]:
         return "no_strike"
     if not ctx.get("market_ok"):
         return "market_not_ready"
-
-    # ── Stage 7 Defense: Realized Volatility / 1h ATR Gate ────────────────────
-    vol_1h = ctx.get("vol_1h_bp")
-    if vol_1h is not None and vol_1h > settings.MAX_1H_VOL_BP:
-        return f"volatility_too_high ({vol_1h:.1f}bp > {settings.MAX_1H_VOL_BP}bp)"
-
-    # ── Stage 7 Alpha: Window Timing Envelope (90s - 600s) ────────────────────
-    elapsed_s = ctx.get("elapsed_s")
-    if elapsed_s is not None:
-        if elapsed_s < settings.MIN_ENTRY_SECOND:
-            return f"timing_too_early ({int(elapsed_s)}s < {settings.MIN_ENTRY_SECOND}s)"
-        if elapsed_s > settings.MAX_ENTRY_SECOND:
-            return f"timing_too_late ({int(elapsed_s)}s > {settings.MAX_ENTRY_SECOND}s)"
-
     return None
 
 async def evaluate_entry(reason: str = "event"):
@@ -1344,13 +1075,27 @@ async def evaluate_entry(reason: str = "event"):
         if block:
             return
 
-        spot_price = binance_stream.get_last().get("price")
+        ps_live = polybolt_feed.live(POLY_WS_MAX_AGE_MS / 1000.0) if _ps_use("prices") else None
+        spot_price = (
+            (ps_live[1] if ps_live else None)
+            or polymarket_ws_stream.get_last().get("price")
+            or chainlink_ws_stream.get_last().get("price")
+            or ctx.get("spot_price")
+        )
         if not spot_price:
             return
 
-        mc_steps = max(1, math.ceil(ctx["time_left_min"] / 5))
+        strike_open, strike_source = (
+            _ps_strike(ctx["start_ms"], ctx["strike_open"], ctx.get("strike_source", "chainlink_ws"))
+            if ctx.get("start_ms")
+            else (ctx.get("strike_open"), ctx.get("strike_source", "chainlink_ws"))
+        )
+        target_open = strike_open if strike_open is not None else ctx.get("target_open")
+
+        t_s = max(0.0, (now * 1000.0 - float(ctx["start_ms"])) / 1000.0) if ctx.get("start_ms") else ctx.get("t_s", 0.0)
+        tau_s = max(0.0, float(ctx.get("time_left_min", 0.0)) * 60.0)
         fair_up = indicators.fair_prob_up(
-            spot_price, ctx["target_open"], mc_steps, ctx["sigma_5m"], drift_per_step=ctx["drift_5m"]
+            spot_price, target_open, tau_s, ctx.get("sigma", 0.000045)
         )
 
         market_up = ctx["prices"]["up"]
@@ -1362,27 +1107,38 @@ async def evaluate_entry(reason: str = "event"):
             market_up = up_ws_sum["bestAsk"]
         if down_ws_sum and down_ws_sum.get("bestAsk"):
             market_down = down_ws_sum["bestAsk"]
+        elif up_ws_sum and up_ws_sum.get("bestBid") and 0.0 < float(up_ws_sum["bestBid"]) < 1.0:
+            market_down = round(1.0 - float(up_ws_sum["bestBid"]), 6)
 
-        eval_open = ctx.get("target_open") or ctx.get("strike_open")
         decision = engines.decide_ev({
             "mcProbUp": fair_up,
             "priceUp": market_up,
             "priceDown": market_down,
             "minProb": settings.MIN_PROB_EV,
             "evThreshold": settings.EV_THRESHOLD,
-            "spotPrice": spot_price,
-            "strikePrice": eval_open,
+            "t_s": t_s,
+            "tau_s": tau_s,
+            "spot": spot_price,
+            "strike": target_open,
+            "minEntrySecond": settings.MIN_ENTRY_SECOND,
+            "maxEntrySecond": settings.MAX_ENTRY_SECOND,
+            "minSecondsLeft": settings.MIN_SECONDS_LEFT,
             "minStrikeDistanceBp": settings.MIN_STRIKE_DISTANCE_BP,
-            "haFlatBottom": ctx.get("ha_15m_flat_bottom", False),
-            "haFlatTop": ctx.get("ha_15m_flat_top", False),
+            "netEvGate": settings.NET_EV_GATE,
+            "feesEnabled": settings.FEES_ENABLED,
+            "feeRate": settings.FEE_RATE,
+            "useVetoes": settings.USE_VETOES,
+            "rsi": ctx["rsi"],
+            "haExhaustedGreen": ctx["ha_exhausted_green"],
+            "haExhaustedRed": ctx["ha_exhausted_red"],
         })
 
         if decision.get("action") == "ENTER":
             market_prices = {"up": market_up, "down": market_down}
             exec_res = await execute_trade(
-                decision, market_prices, ctx["market"], ctx["strike_open"],
+                decision, market_prices, ctx["market"], strike_open,
                 ctx["token_ids"], ctx.get("orderbook", {}),
-                strike_source=ctx["strike_source"], window_start_ms=ctx["start_ms"],
+                strike_source=strike_source, window_start_ms=ctx["start_ms"],
                 open_reason=f"event_entry_{reason}"
             )
             state["event_exec"] = {
@@ -1402,54 +1158,9 @@ async def entry_watcher():
             await evaluate_entry(reason="trade_tick")
         except Exception:
             await asyncio.sleep(0.1)
-async def live_balance_updater():
-    """Background task to continuously poll the CLOB USDC balance (every 2.5s)
-    so the bot always has the live balance in RAM, and precomputes the next
-    live trade stake with 0ms latency at trade time."""
-    while True:
-        try:
-            if settings.PRIVATE_KEY:
-                bal = await asyncio.to_thread(clob_trader.get_usdc_balance)
-                if bal is not None and bal >= 0:
-                    state["live_balance"] = bal
-                    state["last_balance_refresh"] = time.time()
-                    if state.get("trading_mode") == "live":
-                        state["paper_balance"] = bal
-                    _sync_active_trades_to_latest_data()
-
-                    # Precompute the exact trade amount for the next live trade
-                    risk_type = (settings.RISK_TYPE or "percent").lower()
-                    if risk_type == "fixed":
-                        stake = float(settings.RISK_VALUE)
-                    else:
-                        stake = (float(settings.RISK_VALUE) / 100.0) * bal
-
-                    if bal >= 1.0:
-                        stake = max(1.0, min(stake, bal))
-                    else:
-                        stake = 0.0
-
-                    state["precomputed_live_stake"] = round(stake, 2)
-        except Exception:
-            pass
-        await asyncio.sleep(2.5)
 
 
-async def seed_kline_buffers():
-    try:
-        k1m, k5m, k15m = await asyncio.gather(
-            data.fetch_klines(settings.SYMBOL, "1m", 240),
-            data.fetch_klines(settings.SYMBOL, "5m", 200),
-            data.fetch_klines(settings.SYMBOL, "15m", 60)
-        )
-        binance_kline_1m.set_candles(k1m)
-        binance_kline_5m.set_candles(k5m)
-        binance_kline_15m.set_candles(k15m)
-        log_message(f"Seeded Binance kline buffers (1m/5m/15m) for {settings.SYMBOL}")
-    except Exception as e:
-        log_message(f"Failed to seed kline buffers: {e}")
-
-# ── Main update loop ──────────────────────────────────────────────────────────
+# ── Main update loop (POB-main Chainlink-only architecture) ───────────────────
 async def update_loop():
     csv_header = [
         "timestamp", "entry_minute", "time_left_min", "signal",
@@ -1461,46 +1172,26 @@ async def update_loop():
         try:
             timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
 
-            binance_ws = binance_stream.get_last()
-            if not binance_ws.get("price"):
-                poly_ws_last = polymarket_ws_stream.get_last()
-                cl_ws_last = chainlink_ws_stream.get_last()
-                binance_ws["price"] = poly_ws_last.get("price") or cl_ws_last.get("price")
-            poly_ws = polymarket_ws_stream.get_last()
+            poly_ws, poly_from_ps = _ps_live_as_poly_ws(polymarket_ws_stream.get_last())
             cl_ws = chainlink_ws_stream.get_last()
 
             results = await asyncio.gather(
-                data.fetch_last_price(settings.SYMBOL),
                 chainlink.chainlink_fetcher.fetch_chainlink_btc_usd(),
                 fetch_polymarket_snapshot(),
                 return_exceptions=True
             )
 
-            last_price = results[0] if not isinstance(results[0], Exception) else None
-            chainlink_data = results[1] if not isinstance(results[1], Exception) else {}
-            poly_snapshot = results[2] if not isinstance(results[2], Exception) else {"ok": False}
+            chainlink_data = results[0] if not isinstance(results[0], Exception) else {}
+            poly_snapshot = results[1] if not isinstance(results[1], Exception) else {"ok": False}
 
-            klines_1m = binance_kline_1m.get_candles()
-            klines_5m = binance_kline_5m.get_candles()
-            klines_15m = binance_kline_15m.get_candles()
-
-            spot_price = binance_ws.get("price") if binance_ws and binance_ws.get("price") else last_price
-
-            mc_steps = max(1, math.ceil(timing["remainingMinutes"] / 5))
-
-            # Stage 7 Calculations
-            vol_1h_bp = indicators.compute_1h_realized_vol_bp(klines_15m)
-            ha_15m = indicators.compute_15m_ha_structure(klines_15m)
-            elapsed_s = timing["elapsedMs"] / 1000.0
-
-            # Settle feed & freshness
+            # Settle & Spot feed (100% Chainlink, matching POB-main)
             current_price = None
             price_source = None
             price_is_fresh = True
             poly_updated = poly_ws.get("updatedAt") or 0
             if poly_ws.get("price"):
                 current_price = poly_ws["price"]
-                price_source = "Polymarket WS"
+                price_source = "PolyBolt WS" if poly_from_ps else "Polymarket WS"
                 if poly_updated > 0:
                     age_ms = (time.time() * 1000) - poly_updated
                     if age_ms > POLY_WS_MAX_AGE_MS:
@@ -1511,6 +1202,9 @@ async def update_loop():
             elif chainlink_data.get("price"):
                 current_price = chainlink_data["price"]
                 price_source = "Chainlink RPC REST"
+
+            spot_price = current_price
+            _record_chainlink_sample(spot_price)
 
             window_ms = settings.CANDLE_WINDOW_MINUTES * 60_000
             event_start_ms = None
@@ -1531,36 +1225,44 @@ async def update_loop():
                 event_start_ms = int(timing["startMs"])
 
             start_ms = event_start_ms
-            win = mark_window_open(start_ms, window_ms, current_price, spot_price, price_source, price_is_fresh=price_is_fresh)
+            win = mark_window_open(
+                start_ms, window_ms, current_price, spot_price, price_source,
+                price_is_fresh=price_is_fresh,
+                price_ts_ms=poly_updated if poly_updated > 0 else None,
+            )
 
             strike_open = win["chainlink"]
             strike_source = "chainlink_ws"
-
-            model_open = None
-            for c in reversed(klines_5m):
-                if c["openTime"] == start_ms:
-                    model_open = c["open"]
-                    break
-                if c["openTime"] < start_ms:
-                    break
-            model_open = model_open or win.get("binance")
-            target_open = model_open or strike_open
-
-            drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
-            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
-            fair_data = {
-                "prob_up": fair_up,
-                "prob_down": 1.0 - fair_up,
-                "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
-                "steps": mc_steps,
-                "sigma_5m": sigma_5m,
-            }
+            strike_open, strike_source = _ps_strike(start_ms, strike_open, strike_source)
+            if strike_open is not None and win.get("chainlink") is None:
+                win["chainlink"] = strike_open
+                win["genuine"] = True
+            _ps_window_note(start_ms, window_ms, win["chainlink"])
+            model_open = strike_open
+            target_open = strike_open
 
             settlement_ms = None
             if poly_snapshot["ok"] and poly_snapshot["market"].get("endDate"):
                 settlement_ms = datetime.fromisoformat(poly_snapshot["market"]["endDate"].replace('Z', '+00:00')).timestamp() * 1000
 
-            time_left_min = (settlement_ms - time.time() * 1000) / 60_000 if settlement_ms else timing["remainingMinutes"]
+            now_ms = time.time() * 1000.0
+            time_left_min = (settlement_ms - now_ms) / 60_000 if settlement_ms else timing["remainingMinutes"]
+            tau_s = max(0.0, time_left_min * 60.0)
+            t_s = max(0.0, (now_ms - start_ms) / 1000.0)
+
+            sigma = indicators.realized_sigma(_chainlink_grid_prices)
+            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, tau_s, sigma)
+            fair_data = {
+                "prob_up": fair_up,
+                "prob_down": 1.0 - fair_up,
+                "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
+                "tau_s": round(tau_s, 1),
+                "sigma": sigma,
+            }
+
+            rsi_now = indicators.compute_rsi(_chainlink_grid_prices, settings.RSI_PERIOD)
+            ha_green_streak, ha_red_streak, consec = indicators.compute_ha_streaks(_chainlink_grid_prices)
+            consec_5m = consec
 
             market_up = poly_snapshot["prices"]["up"] if poly_snapshot["ok"] else None
             market_down = poly_snapshot["prices"]["down"] if poly_snapshot["ok"] else None
@@ -1576,19 +1278,31 @@ async def update_loop():
             }
             prob_view = {"adjustedUp": fair_up, "adjustedDown": 1 - fair_up}
 
-            # Stage 7 Champion Decision Engine (Micro-vetoes removed)
-            eval_open = target_open or strike_open
+            EB = engines.EXHAUSTION_BARS
+            ha_exhausted_green = ha_green_streak >= EB
+            ha_exhausted_red = ha_red_streak >= EB
+
             decision = engines.decide_ev({
                 "mcProbUp": fair_up,
                 "priceUp": market_up,
                 "priceDown": market_down,
                 "minProb": settings.MIN_PROB_EV,
                 "evThreshold": settings.EV_THRESHOLD,
-                "spotPrice": spot_price,
-                "strikePrice": eval_open,
+                "t_s": t_s,
+                "tau_s": tau_s,
+                "spot": spot_price,
+                "strike": target_open,
+                "minEntrySecond": settings.MIN_ENTRY_SECOND,
+                "maxEntrySecond": settings.MAX_ENTRY_SECOND,
+                "minSecondsLeft": settings.MIN_SECONDS_LEFT,
                 "minStrikeDistanceBp": settings.MIN_STRIKE_DISTANCE_BP,
-                "haFlatBottom": ha_15m.get("flat_bottom", False),
-                "haFlatTop": ha_15m.get("flat_top", False),
+                "netEvGate": settings.NET_EV_GATE,
+                "feesEnabled": settings.FEES_ENABLED,
+                "feeRate": settings.FEE_RATE,
+                "useVetoes": settings.USE_VETOES,
+                "rsi": rsi_now,
+                "haExhaustedGreen": ha_exhausted_green,
+                "haExhaustedRed": ha_exhausted_red,
             })
 
             # Publish trade_ctx for event watcher early entries
@@ -1599,13 +1313,13 @@ async def update_loop():
                     "target_open": target_open,
                     "strike_open": strike_open,
                     "strike_source": strike_source,
+                    "spot_price": spot_price,
+                    "t_s": t_s,
                     "time_left_min": time_left_min,
-                    "elapsed_s": elapsed_s,
-                    "sigma_5m": sigma_5m,
-                    "drift_5m": drift_5m or 0.0,
-                    "vol_1h_bp": vol_1h_bp,
-                    "ha_15m_flat_bottom": ha_15m.get("flat_bottom", False),
-                    "ha_15m_flat_top": ha_15m.get("flat_top", False),
+                    "sigma": sigma,
+                    "rsi": rsi_now,
+                    "ha_exhausted_green": ha_exhausted_green,
+                    "ha_exhausted_red": ha_exhausted_red,
                     "prices": poly_snapshot["prices"],
                     "token_ids": poly_snapshot["token_ids"],
                     "orderbook": poly_snapshot.get("orderbook", {}),
@@ -1618,10 +1332,7 @@ async def update_loop():
             current_prices_dict = {"spot": spot_price, "chainlink": current_price}
 
             exec_result = None
-            block_reason = entry_block_reason(state.get("trade_ctx"))
-            if block_reason:
-                exec_result = block_reason
-            elif poly_snapshot["ok"] and state["running"] and state["withdraw_state"] != "in_progress":
+            if poly_snapshot["ok"] and state["running"] and state["withdraw_state"] != "in_progress":
                 flipped = await maybe_flip_position(decision, poly_snapshot, time_left_min)
                 exec_result = await execute_trade(
                     decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open,
@@ -1656,11 +1367,16 @@ async def update_loop():
                     t["unrealized_pl"] = None
                     open_value += t["amount"]
 
-            # Live balance maintained with 0ms delay by background live_balance_updater
-            is_live = state["trading_mode"] == "live" or (state["trading_mode"] == "hybrid" and bool(settings.PRIVATE_KEY))
-            live_bal = float(state.get("live_balance") or 0.0)
-            current_balance = live_bal if (is_live and settings.PRIVATE_KEY) else float(state["paper_balance"])
-            total_equity = current_balance + open_value
+            # Live balance refresh
+            if state["trading_mode"] == "live":
+                now_ts = time.time()
+                if now_ts - state.get("last_balance_refresh", 0) > 30:
+                    real_bal = await asyncio.to_thread(clob_trader.get_usdc_balance)
+                    if real_bal is not None:
+                        state["paper_balance"] = real_bal
+                    state["last_balance_refresh"] = now_ts
+
+            total_equity = state["paper_balance"] + open_value
             await maybe_auto_withdraw(total_equity, poly_snapshot)
 
             signal_label = f"BUY {decision['side']}" if decision["action"] == "ENTER" else "NO TRADE"
@@ -1678,11 +1394,7 @@ async def update_loop():
                 "trading_state": {
                     "mode": state["trading_mode"],
                     "running": state["running"],
-                    "balance": current_balance,
-                    "paper_balance": state["paper_balance"],
-                    "live_balance": live_bal,
-                    "has_live_creds": bool(settings.PRIVATE_KEY),
-                    "precomputed_live_stake": state.get("precomputed_live_stake", 0.0),
+                    "balance": state["paper_balance"],
                     "equity": total_equity,
                     "open_value": open_value,
                     "active_trades": state["active_trades"],
@@ -1698,22 +1410,6 @@ async def update_loop():
                         "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE
                     }
                 },
-                "strategy_champion": {
-                    "consecutive_losses": state.get("consecutive_losses", 0),
-                    "cb_active": (time.time() * 1000) < state.get("cb_pause_until_ms", 0),
-                    "cb_pause_remaining_s": max(0, int((state.get("cb_pause_until_ms", 0) - time.time() * 1000) / 1000)),
-                    "vol_1h_bp": vol_1h_bp,
-                    "max_1h_vol_bp": settings.MAX_1H_VOL_BP,
-                    "is_skip_hour": datetime.now(timezone.utc).hour in settings.SKIP_HOURS_UTC,
-                    "skip_hours": settings.SKIP_HOURS_UTC,
-                    "elapsed_s": int(elapsed_s),
-                    "min_entry_second": settings.MIN_ENTRY_SECOND,
-                    "max_entry_second": settings.MAX_ENTRY_SECOND,
-                    "min_strike_distance_bp": settings.MIN_STRIKE_DISTANCE_BP,
-                    "spot_vs_strike_bp": round(((spot_price - eval_open) / eval_open * 10000.0), 1) if (spot_price and eval_open and eval_open > 0) else None,
-                    "ha_15m_flat_bottom": ha_15m.get("flat_bottom", False),
-                    "ha_15m_flat_top": ha_15m.get("flat_top", False),
-                },
                 "prices": {
                     "spot": spot_price,
                     "chainlink": current_price,
@@ -1725,11 +1421,13 @@ async def update_loop():
                     "model_open": model_open,
                     "window_start_ms": start_ms,
                     "price_is_fresh": price_is_fresh,
-                    "book_source": poly_snapshot.get("book_source") if poly_snapshot.get("ok") else None
+                    "book_source": poly_snapshot.get("book_source") if poly_snapshot.get("ok") else None,
+                    "price_stream": polybolt_feed.view()
                 },
                 "indicators": {
-                    "ha_15m": ha_15m,
-                    "vol_1h_bp": vol_1h_bp,
+                    "rsi": rsi_now,
+                    "heiken": consec,
+                    "heiken_5m": consec_5m,
                     "fair": fair_data
                 },
                 "analysis": {
@@ -1748,20 +1446,16 @@ async def update_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_state()
-    await seed_kline_buffers()
+    log_message(polybolt.status_line(settings.PRICE_STREAM))
 
     tasks = [
-        asyncio.create_task(binance_stream.start()),
-        asyncio.create_task(binance_kline_1m.start()),
-        asyncio.create_task(binance_kline_5m.start()),
-        asyncio.create_task(binance_kline_15m.start()),
+        asyncio.create_task(polybolt_feed.run_forever()),
         asyncio.create_task(polymarket_ws_stream.start()),
         asyncio.create_task(polymarket_clob_ws.start()),
         asyncio.create_task(chainlink_ws_stream.start()),
         asyncio.create_task(update_loop()),
         asyncio.create_task(telegram_poller()),
-        asyncio.create_task(entry_watcher()),
-        asyncio.create_task(live_balance_updater())
+        asyncio.create_task(entry_watcher())
     ]
 
     yield
@@ -1769,10 +1463,7 @@ async def lifespan(app: FastAPI):
     for task in tasks:
         task.cancel()
 
-    binance_stream.close()
-    binance_kline_1m.close()
-    binance_kline_5m.close()
-    binance_kline_15m.close()
+    polybolt_feed.close()
     polymarket_ws_stream.close()
     polymarket_clob_ws.close()
     chainlink_ws_stream.close()
@@ -1894,11 +1585,7 @@ async def get_settings():
             "alchemy_api_key": mask(settings.ALCHEMY_API_KEY),
             "max_slippage": settings.CLOB_MAX_SLIPPAGE,
             "exit_max_retries": settings.EXIT_MAX_RETRIES,
-            "allow_partial_fill": settings.CLOB_ALLOW_PARTIAL_FILL,
-            "copy_trader": {
-                "retry_interval_ms": settings.COPY_RETRY_INTERVAL_MS,
-                "min_remaining_seconds": settings.COPY_MIN_REMAINING_S
-            }
+            "allow_partial_fill": settings.CLOB_ALLOW_PARTIAL_FILL
         },
         "polymarket": {
             "series_id": settings.POLYMARKET_SERIES_ID,
@@ -1908,23 +1595,16 @@ async def get_settings():
             "up_label": settings.POLYMARKET_UP_LABEL,
             "down_label": settings.POLYMARKET_DOWN_LABEL
         },
-        "strategy": {
-            "ev_threshold": settings.EV_THRESHOLD,
-            "min_prob": settings.MIN_PROB_EV,
-            "min_strike_distance_bp": settings.MIN_STRIKE_DISTANCE_BP,
-            "min_entry_second": settings.MIN_ENTRY_SECOND,
-            "max_entry_second": settings.MAX_ENTRY_SECOND,
-            "circuit_breaker_losses": settings.CIRCUIT_BREAKER_LOSSES,
-            "pause_markets": settings.PAUSE_MARKETS,
-            "max_1h_vol_bp": settings.MAX_1H_VOL_BP,
-            "skip_hours": settings.SKIP_HOURS_UTC,
-            "min_book_liquidity_usd": settings.MIN_BOOK_LIQUIDITY_USD,
-            "max_book_age_s": settings.MAX_BOOK_AGE_S
-        },
         "trading": {
             "symbol": settings.SYMBOL,
             "risk_type": settings.RISK_TYPE,
             "risk_value": settings.RISK_VALUE
+        },
+        "ev": {
+            "ev_threshold": settings.EV_THRESHOLD,
+            "min_prob": settings.MIN_PROB_EV,
+            "min_book_liquidity_usd": settings.MIN_BOOK_LIQUIDITY_USD,
+            "max_book_age_s": settings.MAX_BOOK_AGE_S
         },
         "flip": {
             "enabled": settings.FLIP_ENABLED,
@@ -1945,12 +1625,13 @@ async def get_settings():
         "telegram": {
             "enabled": settings.TELEGRAM_ENABLED,
             "bot_token": mask(settings.TELEGRAM_BOT_TOKEN)
-        }
+        },
+        "price_stream": settings.PRICE_STREAM
     }
 
 @app.post("/api/settings")
 async def post_settings(new_settings: Dict[str, Any]):
-    global binance_stream, polymarket_ws_stream, chainlink_ws_stream, binance_kline_1m, binance_kline_5m, binance_kline_15m
+    global polymarket_ws_stream, chainlink_ws_stream
     old_symbol = settings.SYMBOL
 
     new_pk = new_settings.get("private_key")
@@ -1973,10 +1654,6 @@ async def post_settings(new_settings: Dict[str, Any]):
         except Exception:
             existing_cfg = {}
 
-    # Clean legacy ev key to eliminate repetition in config.json
-    existing_cfg.pop("ev", None)
-    new_settings.pop("ev", None)
-
     def deep_merge(base, override):
         for k, v in override.items():
             if isinstance(v, dict) and isinstance(base.get(k), dict):
@@ -1998,22 +1675,13 @@ async def post_settings(new_settings: Dict[str, Any]):
         settings.RISK_TYPE = t.get("risk_type", settings.RISK_TYPE)
         settings.RISK_VALUE = float(t.get("risk_value", settings.RISK_VALUE))
 
-    if "strategy" in new_settings:
-        st = new_settings["strategy"]
-        if "ev_threshold" in st: settings.EV_THRESHOLD = float(st["ev_threshold"])
-        if "min_prob" in st: settings.MIN_PROB_EV = float(st["min_prob"])
-        if "min_strike_distance_bp" in st: settings.MIN_STRIKE_DISTANCE_BP = float(st["min_strike_distance_bp"])
-        if "min_entry_second" in st: settings.MIN_ENTRY_SECOND = int(st["min_entry_second"])
-        if "max_entry_second" in st: settings.MAX_ENTRY_SECOND = int(st["max_entry_second"])
-        if "circuit_breaker_losses" in st: settings.CIRCUIT_BREAKER_LOSSES = int(st["circuit_breaker_losses"])
-        if "pause_markets" in st:
-            settings.PAUSE_MARKETS = int(st["pause_markets"])
-            settings.CIRCUIT_BREAKER_PAUSE_MARKETS = int(st["pause_markets"])
-        if "max_1h_vol_bp" in st: settings.MAX_1H_VOL_BP = float(st["max_1h_vol_bp"])
-        if "skip_hours" in st:
-            settings.SKIP_HOURS_UTC = [int(h) for h in st["skip_hours"]]
-        if "min_book_liquidity_usd" in st: settings.MIN_BOOK_LIQUIDITY_USD = float(st["min_book_liquidity_usd"])
-        if "max_book_age_s" in st: settings.MAX_BOOK_AGE_S = float(st["max_book_age_s"])
+    if "ev" in new_settings:
+        e = new_settings["ev"]
+        settings.EV_THRESHOLD = float(e.get("ev_threshold", settings.EV_THRESHOLD))
+        settings.MIN_PROB_EV = float(e.get("min_prob", settings.MIN_PROB_EV))
+        settings.MIN_BOOK_LIQUIDITY_USD = float(e.get("min_book_liquidity_usd", settings.MIN_BOOK_LIQUIDITY_USD))
+        if "max_book_age_s" in e:
+            settings.MAX_BOOK_AGE_S = float(e["max_book_age_s"])
 
     if "flip" in new_settings:
         f = new_settings["flip"]
@@ -2036,12 +1704,6 @@ async def post_settings(new_settings: Dict[str, Any]):
             settings.EXIT_MAX_RETRIES = int(lv["exit_max_retries"])
         if "allow_partial_fill" in lv:
             settings.CLOB_ALLOW_PARTIAL_FILL = bool(lv["allow_partial_fill"])
-        if "copy_trader" in lv and isinstance(lv["copy_trader"], dict):
-            ct = lv["copy_trader"]
-            if "retry_interval_ms" in ct:
-                settings.COPY_RETRY_INTERVAL_MS = int(ct["retry_interval_ms"])
-            if "min_remaining_seconds" in ct:
-                settings.COPY_MIN_REMAINING_S = float(ct["min_remaining_seconds"])
 
         rk = lv.get("relayer_api_key")
         if rk and "..." not in rk:
@@ -2074,39 +1736,32 @@ async def post_settings(new_settings: Dict[str, Any]):
         if tok and "..." not in tok:
             settings.TELEGRAM_BOT_TOKEN = str(tok).strip()
 
+    if "price_stream" in new_settings and isinstance(new_settings["price_stream"], dict):
+        settings.PRICE_STREAM = polybolt.merged({**settings.PRICE_STREAM, **new_settings["price_stream"]})
+        log_message(polybolt.status_line(settings.PRICE_STREAM))
+
     clob_trader.reset()
 
     state["trading_mode"] = settings.MODE
     state["paper_balance"] = settings.PAPER_BALANCE_USD
 
     if settings.SYMBOL != old_symbol:
-        binance_stream.close()
-        binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_update=_wake_entry)
-        asyncio.create_task(binance_stream.start())
-
-        binance_kline_1m.close()
-        binance_kline_1m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="1m", limit=240)
-        asyncio.create_task(binance_kline_1m.start())
-
-        binance_kline_5m.close()
-        binance_kline_5m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="5m", limit=200)
-        asyncio.create_task(binance_kline_5m.start())
-
-        binance_kline_15m.close()
-        binance_kline_15m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="15m", limit=60)
-        asyncio.create_task(binance_kline_15m.start())
-
-        await seed_kline_buffers()
+        _chainlink_grid_prices.clear()
+        polybolt_feed.set_symbol(polybolt.symbol_for(settings.SYMBOL))
 
         polymarket_ws_stream.close()
         polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
             ws_url=settings.POLYMARKET_LIVE_DATA_WS_URL,
-            symbol_includes=get_ws_symbol_filter(settings.SYMBOL)
+            symbol_includes=get_ws_symbol_filter(settings.SYMBOL),
+            on_update=_on_chainlink_tick
         )
         asyncio.create_task(polymarket_ws_stream.start())
 
         chainlink_ws_stream.close()
-        chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL))
+        chainlink_ws_stream = ws_data.ChainlinkPriceStream(
+            aggregator=settings.get_aggregator(settings.SYMBOL),
+            on_update=_on_chainlink_tick
+        )
         asyncio.create_task(chainlink_ws_stream.start())
 
     await broadcast_state()
@@ -2214,4 +1869,5 @@ async def get_history():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8040)
+    # Bind to localhost by default for security (use UVICORN_HOST env var to override)
+    uvicorn.run(app, host=os.getenv("UVICORN_HOST", "127.0.0.1"), port=8080)

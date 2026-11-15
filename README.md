@@ -1,87 +1,56 @@
 # Polymarket BTC 15m Assistant (Python FastAPI)
 
-A real-time, high-performance automated trading assistant for Polymarket **"Bitcoin Up or Down" 15-minute** binary options markets, powered by FastAPI and the **Stage 7: Circuit Breaker + Volatility Gate (<45 bp) + Skip 18 & 23 UTC (Vetoes OFF) 🏆** quantitative strategy.
+A real-time trading assistant for Polymarket **"Bitcoin Up or Down" 15-minute** markets, ported to Python and FastAPI.
 
-> **📖 Empirical Backtest Reference:** Ranked **#1 Overall Champion** across 24 simulated strategy configurations on 2,880 historical 15m Polymarket BTC markets in `Scripts/results/optimization_report.md` (Net Profit: **+$471,070.12**, Win Rate: **87.01%**, Profit Factor: **1.73**, Max Drawdown: **-29.44%**, Total Trades: **639**).
+> **📖 Full reference: [`documentation.md`](documentation.md)** — the strategy, the
+> strike mechanism, settlement, config, API and known limits, in detail. This README is
+> the quick start.
 
----
-
-## 🏆 Stage 7: Circuit Breaker + Volatility Gate (<45 bp) + Skip 18 & 23 UTC (Vetoes OFF)
-
-The bot utilizes the Stage 7 quantitative engine, combining latency arbitrage with structural trend filters and systematic drawdown defense:
-
-### 1. Alpha & Conviction Gates
-- **Closed-Form Fair Probability Model**: High-frequency Geometric Brownian Motion (GBM) calculating true directional probability from live Binance spot ticks vs Polymarket CLOB ask prices.
-- **Expected Value (EV) Gate (`ev_threshold: 0.04`)**: Requires at least a **4¢ net edge** ($\text{fair prob} - \text{market ask} \ge 0.04$) before placing orders.
-- **Directional Floor (`min_prob: 0.55`)**: Forbids 50/50 coin-flip entries even if EV appears slightly positive.
-- **Strike Moneyness Lead (`min_strike_distance_bp: 6.0`)**: Requires Bitcoin spot to have moved at least **6.0 basis points** ($\approx \$60$ on BTC) away from the market opening strike in the bet direction, completely eliminating the hostile 50/50 chop noise zone.
-- **15m Structural Heiken-Ashi Alignment**: Built-in institutional trend rule. Analyzes the active 15m Heiken-Ashi candle to block counter-trend DOWN bets during flat-bottom green expansion candles (institutional bull trends) and block UP bets during flat-top red candles (institutional bear trends).
-- **Micro-Vetoes OFF**: 1m RSI and 1m/5m Heiken-Ashi exhaustion streak vetoes are **completely bypassed**. Backtesting demonstrated that micro-vetoes prematurely halted strong 15m trend continuations that held a $69.5\%$ win rate.
-
-### 2. Drawdown Defense Architecture
-- **Consecutive Loss Circuit Breaker (`circuit_breaker_losses: 2`, `pause_markets: 4`)**: Reaching **2 consecutive losses** indicates hostile consolidation chop. The bot automatically halts new entries for **4 markets (60 minutes)** to protect capital, resetting on the next win.
-- **Realized Volatility / 1h ATR Ceiling (`max_1h_vol_bp: 45.0`)**: Evaluates the trailing 1-hour True Range across active 15m klines. Blocks trades when volatility exceeds $45.0\text{ bp}$ (violent macro whipsaws).
-- **Window Timing Envelope (`min_entry_second: 90`, `max_entry_second: 600`)**: Trades only between second 90 and second 600 (minute 1.5 to minute 10) of each 15m candle, skipping chaotic open spreads and late-candle volatility decay.
-- **Transition Hours Filter (`skip_hours: [18, 23] UTC`)**: Automatically sits out 18:00 UTC (US equity cash close rebalance) and 23:00 UTC (daily funding settlement).
-
----
+It runs a **latency-arbitrage** strategy: a fast closed-form fair probability from
+Binance spot vs Polymarket's (possibly stale) implied price, traded on the gap, with
+position size set by a simple percent-of-balance or fixed-dollar risk. See
+[`strategy.md`](strategy.md) for the full rationale.
 
 ## Features
 
-- **Real-Time Web Dashboard**: Responsive dark-mode interface built with FastAPI, Jinja2, Alpine.js, and WebSockets.
-- **Stage 7 Strategy Monitor**: Live visual tracking of Moneyness Lead, 15m HA Structure, 1h Realized Volatility, Timing Gate, and Circuit Breaker status.
-- **Multi-Stream Ingestion**: Concurrent WebSocket streams for Binance Spot, Binance Klines (1m, 5m, 15m), Polymarket CLOB Level 2 Orderbook, and Chainlink Price Feeds.
-- **Trading Modes**: Seamless toggle between zero-risk **Paper Trading** and on-chain **Live Trading**.
-- **Gasless Polymarket CLOB V2 Execution**: Places Fill-Or-Kill (FOK) market orders via `polymarket-apis` using the official gasless deposit-wallet flow.
-- **Capital Extractor**: Configurable auto-withdrawal state machine to sweep accumulated profits to your cold storage or EOA wallet.
-- **Telegram Notifications**: Real-time alerts for Trade Entries, Wins, Losses, Circuit Breaker triggers, and Auto-Withdrawals.
-
----
+- Real-time Web Dashboard (FastAPI + Jinja2 + Alpine.js)
+- Fast fair-probability model (closed-form GBM) + EV entry engine
+- Veto filters: RSI extremes, Heiken-Ashi exhaustion
+- Trade Execution: Paper Trading simulation vs Live Mode toggle
+- Data Sources: Binance, Polymarket (Gamma/CLOB), Chainlink (WebSocket + RPC)
+- Proxy Support: Global HTTP/HTTPS/SOCKS proxy configuration
 
 ## Requirements
 
-- Python **3.12+**
-- pip package manager
+- Python **3.12+** — required, not preferred. `polymarket-apis` declares
+  `Requires-Python >=3.12`; on 3.11 pip ignores every published version and fails with
+  the confusing `Could not find a version ... (from versions: none)`.
+- pip (comes with Python)
 
----
+## Local Run
 
-## Quick Start
-
-### 1) Install Dependencies
+### 1) Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2) Configuration (`config.json`)
+### 2) Configure `config.json`
 
-All parameters are centrally managed in `config.json` and editable live in the dashboard **Settings** page:
+Set your trading mode, risk preferences, and optional private key in `config.json`.
+Position size is set by `trading.risk_type` (`"percent"` = `risk_value`% of balance,
+or `"fixed"` = `risk_value` dollars) and `trading.risk_value`. The entry engine is
+tuned in the `ev` block:
 
-```json
-{
-  "mode": "paper",
-  "paper_balance_usd": 1000.0,
-  "trading": {
-    "symbol": "BTCUSDT",
-    "candle_window_minutes": 15,
-    "risk_type": "percent",
-    "risk_value": 10
-  },
-  "strategy": {
-    "ev_threshold": 0.04,
-    "min_prob": 0.55,
-    "min_strike_distance_bp": 6.0,
-    "min_entry_second": 90,
-    "max_entry_second": 600,
-    "circuit_breaker_losses": 2,
-    "pause_markets": 4,
-    "max_1h_vol_bp": 45.0,
-    "skip_hours": [18, 23],
-    "min_book_liquidity_usd": 20.0,
-    "max_book_age_s": 3.0
-  }
+```jsonc
+"ev": {
+  "ev_threshold": 0.04,          // enter only when fair prob − share price ≥ this (the edge gate)
+  "min_prob": 0.55,              // never bet near-coinflips even if EV looks positive
+  "min_book_liquidity_usd": 20.0 // skip if the ask side can't absorb the stake
 }
 ```
+
+All of these are also editable live on the **Settings** page.
 
 ### 3) Run
 
@@ -89,22 +58,64 @@ All parameters are centrally managed in `config.json` and editable live in the d
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Open your browser to `http://localhost:8000`.
+Access the dashboard at `http://localhost:8000`.
 
----
+## Docker
 
-## Live Trading Setup (Gasless CLOB V2)
+```bash
+docker build -t polymarket-assistant .
+docker run -p 8000:8000 polymarket-assistant
+```
 
-To enable real-money trading on Polymarket:
+## Deployment on Render
 
-1. **Private Key**: Provide your Polygon private key in `config.json` or on the Settings page. This key signs orders locally; gas is sponsored by Polymarket's relayer.
-2. **Relayer API Key**: Obtain a Polymarket Builder / Relayer API key and configure it under `relayer.api_key`.
-3. **Wallet Connection**: In the Settings page, click **Test Connection** to detect your deposit wallet and view current pUSD balances.
-4. **Deploy & Approve**: Click **Setup Wallet (gasless)** to execute one-time token approvals.
-5. **Start Trading**: Switch mode to `live`, set your risk parameters, and press **Start** on the main dashboard.
+If you are seeing errors related to Node.js or `npm run start`, it is because Render is auto-detecting the old environment. **You must manually set the runtime to Python.**
 
----
+### Recommended: Use `render.yaml`
+The repository includes a `render.yaml`. When creating a new blueprint on Render, it will automatically set the correct environment.
 
-## Safety & Disclaimer
+### Manual Setup
+1. Create a **Web Service** on Render.
+2. Under **Runtime**, explicitly select **Python 3**.
+3. Set the following commands:
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port 8000`
+4. Add any necessary environment variables (optional).
 
-This software is for quantitative research and educational purposes. Automated trading involves substantial financial risk. Run extensively in **Paper Mode** to confirm performance and latency alignment before risking capital in live markets.
+## Live Trading
+
+Switching **Mode** to `live` makes the bot place real **Fill-Or-Kill market BUY**
+orders on **Polymarket CLOB V2** via `polymarket-apis`, using the gasless
+**deposit-wallet** flow.
+
+Your trading wallet is **derived from your key** — there is no signature type or funder
+address to choose. The bot checks the deposit, proxy and safe wallets and trades from
+whichever actually holds **pUSD**.
+
+1. Set a **private key or 12/24-word seed phrase** (Settings → Credentials, or
+   `config.json`). It signs orders but holds no funds and needs no gas.
+2. Set the **Relayer API key** (`config.json` → `relayer.api_key`). It sponsors the
+   one-time on-chain setup, so you never pay gas. Optionally set an **Alchemy key** for
+   a private Polygon RPC.
+3. Click **Test Connection** — read-only, no relayer key needed. It lists every derived
+   wallet with its pUSD balance and ticks the one that will be traded.
+4. **Deposit pUSD** to that wallet through Polymarket.
+5. Click **Setup Wallet (gasless)** to deploy + approve it. Once per fresh wallet.
+6. *(Optional)* **Enable Auto-Redeem** so wins convert back to pUSD by themselves.
+
+Orders are **slippage-capped**: the limit is the quote plus `CLOB_MAX_SLIPPAGE`
+(default 2¢), so if the book moves away the order is killed rather than filled badly. A
+fill is only recorded when it is positively confirmed, and the trade is stamped with the
+**actual** fill price and size. In live mode the dashboard balance is the real on-chain
+pUSD balance (refreshed every 30s). Order failures appear in the Console Log.
+
+**Press Start on the dashboard** — the bot does not trade until you do.
+
+## Safety
+
+This is not financial advice. Use at your own risk; live mode trades real funds.
+
+**The edge is unproven.** The model has no predictive edge over "is spot already above
+the open" — that signal is fully priced by the market. The only remaining edge is
+latency (beating the book's repricing). Run in **paper mode** and confirm EV-positive
+trades actually exist against the real book *before* risking capital.

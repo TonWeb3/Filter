@@ -1,77 +1,101 @@
 from typing import Dict, Any
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Stage 7: CB + Vol (<45 bp) + Skip 18 & 23 UTC (Vetoes OFF) Entry Engine
+#  POB-main Chainlink-only EV entry engine.
 #
-#  Optimized quantitative binary options model for Polymarket 15m markets (#1 Champion):
-#    1. Fast GBM Fair Probability vs Polymarket CLOB ask price (EV gate >= 0.04)
-#    2. Strike Moneyness Margin of Safety: minimum 6.0 bp lead from strike price
-#       eliminates the 50/50 chop noise zone.
-#    3. 15m Structural Heiken-Ashi: forbids counter-trend entries against flat-base
-#       expansion candles.
-#    4. 1m/5m micro vetoes are removed to allow strong 15m breakout momentum.
+#  Matches POB-main/backtest.py (simulate_strategy_fast):
+#  - Evaluates Chainlink-based fair_up vs Polymarket CLOB ask prices.
+#  - Enforces timing window gates (min_entry_second, max_entry_second, min_seconds_left).
+#  - Optional net fee EV hurdle (deducting fee_rate * p * (1 - p)).
+#  - Optional RSI (>70 / <30) and Heiken-Ashi (>=6 streak) vetoes when use_vetoes is True.
+#  - Optional moneyness / strike distance filter (min_strike_distance_bp).
 # ─────────────────────────────────────────────────────────────────────────────
+
+EXHAUSTION_BARS = 6
 
 
 def _no_ev(reason: str) -> Dict[str, Any]:
-    return {"action": "NO_TRADE", "side": None, "phase": "STAGE7", "strength": "EV", "reason": reason}
+    return {"action": "NO_TRADE", "side": None, "phase": "EV", "strength": "EV", "reason": reason}
 
 
 def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    """Stage 7 Entry Engine: CB + Vol (<45 bp) + Skip 18 & 23 UTC (Vetoes OFF).
-    Fair probability vs market ask price, gated by Moneyness margin of safety (6.0 bp)
-    and 15m structural Heiken-Ashi alignment. Micro-vetoes are completely bypassed
-    as per the champion optimization report (+$471,070.12 net profit, 87.01% WR).
-    """
+    """POB-main EV gate: Chainlink fair probability vs Polymarket ask price."""
     p_up = inputs.get("mcProbUp")
-    price_up = inputs.get("priceUp")     # ask (buy) price for the UP share, 0..1
-    price_down = inputs.get("priceDown") # ask (buy) price for the DOWN share, 0..1
+    price_up = inputs.get("priceUp")      # ask (buy) price for the UP share, 0..1
+    price_down = inputs.get("priceDown")  # ask (buy) price for the DOWN share, 0..1
 
     if p_up is None:
         return _no_ev("missing_model_data")
     if price_up is None or price_down is None:
         return _no_ev("missing_prices")
+    if price_up <= 0.001 or price_up >= 0.999 or price_down <= 0.001 or price_down >= 0.999:
+        return _no_ev("invalid_quote_bounds")
+
+    # Timing gates from POB-main
+    t_s = inputs.get("t_s")
+    tau_s = inputs.get("tau_s")
+    min_ts = int(inputs.get("minEntrySecond", 0))
+    max_ts = int(inputs.get("maxEntrySecond", 840))
+    min_seconds_left = int(inputs.get("minSecondsLeft", 20))
+
+    if t_s is not None and (t_s < min_ts or t_s > max_ts):
+        return _no_ev(f"entry_time_{int(t_s)}s_outside_{min_ts}_{max_ts}s")
+    if tau_s is not None and tau_s < min_seconds_left:
+        return _no_ev(f"tau_{int(tau_s)}s_below_{min_seconds_left}s")
 
     p_down = 1.0 - p_up
     ev_up = p_up - price_up
     ev_down = p_down - price_down
 
-    side = "UP" if ev_up >= ev_down else "DOWN"
-    p = p_up if side == "UP" else p_down
-    price = price_up if side == "UP" else price_down
-    ev = ev_up if side == "UP" else ev_down
+    fees_enabled = bool(inputs.get("feesEnabled", True))
+    net_ev_gate = bool(inputs.get("netEvGate", False))
+    fee_rate = float(inputs.get("feeRate", 0.07))
 
-    min_prob = inputs.get("minProb", 0.55)
-    ev_threshold = inputs.get("evThreshold", 0.04)
+    f_up = (fee_rate * price_up * (1.0 - price_up)) if (fees_enabled and net_ev_gate) else 0.0
+    f_down = (fee_rate * price_down * (1.0 - price_down)) if (fees_enabled and net_ev_gate) else 0.0
+    h_ev_up = ev_up - f_up
+    h_ev_down = ev_down - f_down
 
-    # ── STAGE 7 ALPHA 1: Strike Moneyness Margin of Safety (6.0 bp lead) ─────
-    # Bitcoin must have moved at least 6.0 bp (~$60 on BTC) away from open strike
-    spot = inputs.get("spotPrice")
-    strike = inputs.get("strikePrice")
-    min_strike_bp = inputs.get("minStrikeDistanceBp", 6.0)
-    move_bp = (spot - strike) / strike * 10000.0 if (spot and strike and strike > 0) else 0.0
-    if min_strike_bp > 0 and spot and strike and strike > 0:
-        if side == "UP" and move_bp < min_strike_bp:
-            return _no_ev(f"moneyness_up_{move_bp:.1f}bp_lt_{min_strike_bp:.1f}bp")
-        if side == "DOWN" and move_bp > -min_strike_bp:
-            return _no_ev(f"moneyness_down_{move_bp:.1f}bp_gt_{-min_strike_bp:.1f}bp")
+    side_is_up = h_ev_up >= h_ev_down
+    side = "UP" if side_is_up else "DOWN"
+    p = p_up if side_is_up else p_down
+    price = price_up if side_is_up else price_down
+    raw_ev = ev_up if side_is_up else ev_down
+    h_ev = h_ev_up if side_is_up else h_ev_down
 
-    # ── STAGE 7 ALPHA 2: 15m Structural Heiken-Ashi Alignment ────────────────
-    # Core strategy rule: blocks counter-trend bets against institutional expansion candles
-    if side == "DOWN" and inputs.get("haFlatBottom"):
-        return _no_ev("ha_15m_flat_bottom_bullish_block")
-    if side == "UP" and inputs.get("haFlatTop"):
-        return _no_ev("ha_15m_flat_top_bearish_block")
+    min_prob = float(inputs.get("minProb", 0.55))
+    ev_threshold = float(inputs.get("evThreshold", 0.04))
+    use_vetoes = bool(inputs.get("useVetoes", True))
 
-    # ── Mathematical Probability & EV Gates ──────────────────────────────────
+    # Filter 1: Micro vetoes (RSI & Heiken-Ashi streaks on Chainlink ticks)
+    if use_vetoes:
+        rsi = inputs.get("rsi")
+        if side_is_up and ((rsi is not None and rsi > 70.0) or inputs.get("haExhaustedGreen")):
+            return _no_ev("rsi_overbought" if (rsi is not None and rsi > 70.0) else "ha_exhausted_up")
+        if (not side_is_up) and ((rsi is not None and rsi < 30.0) or inputs.get("haExhaustedRed")):
+            return _no_ev("rsi_oversold" if (rsi is not None and rsi < 30.0) else "ha_exhausted_down")
+
+    # Filter 2: Moneyness / Strike Distance (basis points)
+    min_bp = float(inputs.get("minStrikeDistanceBp", 0.0))
+    if min_bp > 0:
+        spot = inputs.get("spot")
+        strike = inputs.get("strike")
+        if not spot or not strike or strike <= 0:
+            return _no_ev("missing_spot_or_strike")
+        move_bp = (spot - strike) / strike * 10000.0
+        if side_is_up and move_bp < min_bp:
+            return _no_ev(f"move_bp_{move_bp:.1f}_below_{min_bp:.1f}")
+        if (not side_is_up) and move_bp > -min_bp:
+            return _no_ev(f"move_bp_{move_bp:.1f}_above_{-min_bp:.1f}")
+
+    # Edge & Probability Gating
     if p < min_prob:
         return _no_ev(f"prob_{p:.2f}_below_{min_prob:.2f}")
-    if ev < ev_threshold:
-        return _no_ev(f"ev_{ev:.3f}_below_{ev_threshold:.3f}")
+    if h_ev < ev_threshold:
+        return _no_ev(f"ev_{h_ev:.3f}_below_{ev_threshold:.3f}")
 
     strength = "HIGH_CONVICTION" if p >= 0.70 else "STRONG"
     return {
-        "action": "ENTER", "side": side, "phase": "STAGE7", "strength": strength,
-        "prob": p, "price": price, "ev": ev, "move_bp": round(move_bp, 2),
-        "reason": "stage7_ev_enter"
+        "action": "ENTER", "side": side, "phase": "EV", "strength": strength,
+        "prob": p, "price": price, "ev": raw_ev, "reason": "ev_enter"
     }

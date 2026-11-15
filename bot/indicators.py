@@ -1,198 +1,92 @@
-import pandas as pd
-import numpy as np
 import math
-import time
-from collections import deque
-from ta.momentum import RSIIndicator
-from typing import List, Optional, Dict
+import numpy as np
+from typing import List, Optional, Dict, Tuple, Sequence
+
+SQRT2 = math.sqrt(2.0)
 
 
-def compute_rsi(closes: List[float], period: int) -> Optional[float]:
-    """RSI(period). Used as a veto: don't buy UP into >70 / DOWN into <30."""
-    if not closes or len(closes) < period:
+def compute_rsi(prices: Sequence[float], period: int = 14) -> Optional[float]:
+    """Calculates Wilder's RSI over a 1D Chainlink price array (matching POB-main/backtest.py)."""
+    arr = np.asarray(prices, dtype=float)
+    if len(arr) < period + 1:
         return None
-    series = pd.Series(closes)
-    rsi = RSIIndicator(close=series, window=period).rsi()
-    if rsi.empty:
-        return None
-    val = rsi.iloc[-1]
-    return float(val) if not pd.isna(val) else None
+    deltas = np.diff(arr)
+    seed = deltas[:period]
+    up = seed[seed >= 0].sum() / period
+    down = -seed[seed < 0].sum() / period
+    rs = up / down if down != 0 else 0.0
+    rsi_val = 100.0 - 100.0 / (1.0 + rs) if down != 0 else 100.0
 
-
-def compute_heiken_ashi(candles: List[Dict]) -> List[Dict]:
-    """Heiken-Ashi candles calculation (used for 15m structural trend alignment)."""
-    if not candles:
-        return []
-
-    ha = []
-    for i in range(len(candles)):
-        c = candles[i]
-        ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4
-
-        if i > 0:
-            prev = ha[i - 1]
-            ha_open = (prev["open"] + prev["close"]) / 2
+    upval = up
+    downval = down
+    for i in range(period + 1, len(arr)):
+        delta = deltas[i - 1]
+        if delta > 0:
+            upval = (upval * (period - 1) + delta) / period
+            downval = (downval * (period - 1)) / period
         else:
-            ha_open = (c["open"] + c["close"]) / 2
-
-        ha_high = max(c["high"], ha_open, ha_close)
-        ha_low = min(c["low"], ha_open, ha_close)
-
-        ha.append({
-            "open": ha_open,
-            "high": ha_high,
-            "low": ha_low,
-            "close": ha_close,
-            "isGreen": ha_close >= ha_open,
-            "body": abs(ha_close - ha_open)
-        })
-    return ha
+            upval = (upval * (period - 1)) / period
+            downval = (downval * (period - 1) + (-delta)) / period
+        rs = upval / downval if downval != 0 else 0.0
+        rsi_val = 100.0 - 100.0 / (1.0 + rs) if downval != 0 else 100.0
+    return float(rsi_val) if np.isfinite(rsi_val) else None
 
 
-def count_consecutive(ha_candles: List[Dict]) -> Dict:
-    """Length of the current same-colour Heiken-Ashi streak."""
-    if not ha_candles or len(ha_candles) < 2:
-        return {"color": None, "count": None}
+def compute_ha_streaks(prices: Sequence[float]) -> Tuple[int, int, Dict[str, Optional[object]]]:
+    """Computes Heiken-Ashi consecutive streaks (green_streak, red_streak) over a 1D
+    Chainlink price array, matching POB-main/backtest.py."""
+    arr = np.asarray(prices, dtype=float)
+    n = len(arr)
+    if n < 2:
+        return 0, 0, {"color": None, "count": None}
 
-    last = ha_candles[-1]
-    target = "green" if last["isGreen"] else "red"
+    ha_open = float(arr[0])
+    curr_color: Optional[str] = None
+    streak = 0
 
-    count = 0
-    for i in range(len(ha_candles) - 1, -1, -1):
-        c = ha_candles[i]
-        color = "green" if c["isGreen"] else "red"
-        if color != target:
-            break
-        count += 1
+    for i in range(1, n):
+        ha_close = float(arr[i])
+        ha_open = (ha_open + float(arr[i - 1])) / 2.0
+        is_green = ha_close >= ha_open
+        color = "green" if is_green else "red"
 
-    return {"color": target, "count": count}
+        if color == curr_color:
+            streak += 1
+        else:
+            curr_color = color
+            streak = 1
 
-
-def compute_1h_realized_vol_bp(klines_15m: List[Dict]) -> Optional[float]:
-    """Calculates trailing 1-hour realized ATR range in basis points over the last 4 15m candles."""
-    if not klines_15m or len(klines_15m) < 4:
-        return None
-    recent = klines_15m[-4:]
-    highs = [float(k.get("high") or k["close"]) for k in recent if k.get("close") is not None]
-    lows = [float(k.get("low") or k["close"]) for k in recent if k.get("close") is not None]
-    if not highs or not lows:
-        return None
-    close = float(recent[-1]["close"])
-    if close <= 0:
-        return None
-    return float((max(highs) - min(lows)) / close * 10000.0)
+    green_streak = streak if curr_color == "green" else 0
+    red_streak = streak if curr_color == "red" else 0
+    return green_streak, red_streak, {"color": curr_color, "count": streak}
 
 
-def compute_15m_ha_structure(klines_15m: List[Dict]) -> Dict[str, bool]:
-    """Computes Heiken-Ashi candle structure on the latest 15m candle.
-    Returns:
-      flat_bottom: True if green expansion candle with flat bottom (no lower shadow, institutional bullish).
-      flat_top: True if red expansion candle with flat top (no upper shadow, institutional bearish).
+def realized_sigma(prices: Sequence[float], default_sigma: float = 0.000045) -> float:
+    """Computes per-tick log-return standard deviation over Chainlink prices (matching POB-main)."""
+    arr = np.asarray(prices, dtype=float)
+    arr = arr[np.isfinite(arr) & (arr > 0)]
+    if arr.size > 100:
+        r = np.diff(np.log(arr))
+        r = r[np.isfinite(r)]
+        if r.size > 10:
+            sig = float(np.std(r))
+            if sig > 0:
+                return sig
+    return default_sigma
+
+
+def fair_prob_up(spot: float, strike: float, tau_s: float,
+                 sigma: Optional[float] = 0.000045) -> float:
+    """POB-main continuous-seconds zero-drift normal CDF model:
+        z = ln(spot / strike) / (sigma * sqrt(tau_s))
+        fair_up = Phi(z)
     """
-    if not klines_15m or len(klines_15m) < 2:
-        return {"flat_bottom": False, "flat_top": False}
-
-    ha = compute_heiken_ashi(klines_15m)
-    if not ha:
-        return {"flat_bottom": False, "flat_top": False}
-
-    last_ha = ha[-1]
-    ha_open = last_ha["open"]
-    ha_high = last_ha["high"]
-    ha_low = last_ha["low"]
-    is_green = last_ha["isGreen"]
-
-    # Flat bottom: green candle, lower shadow is non-existent or tiny (< 0.02% of open)
-    flat_bottom = is_green and (ha_open <= ha_low or abs(ha_open - ha_low) / max(ha_open, 1.0) < 0.0002)
-    # Flat top: red candle, upper shadow is non-existent or tiny (< 0.02% of open)
-    flat_top = (not is_green) and (ha_open >= ha_high or abs(ha_high - ha_open) / max(ha_open, 1.0) < 0.0002)
-
-    return {"flat_bottom": bool(flat_bottom), "flat_top": bool(flat_top)}
-
-
-def realized_drift_vol(candles: List[Dict], lookback: int = 300):
-    """(mean, std) of per-candle log returns — the per-step drift & sigma for the
-    fair-prob model. Returns (None, None) if there isn't enough data."""
-    closes = [c["close"] for c in candles[-lookback:] if c.get("close")]
-    if len(closes) < 20:
-        return None, None
-    arr = np.asarray(closes, dtype=float)
-    rets = np.diff(np.log(arr))
-    rets = rets[np.isfinite(rets)]
-    if len(rets) < 10:
-        return None, None
-    return float(np.mean(rets)), float(np.std(rets))
-
-
-def fair_prob_up(current_price: float, strike: float, steps: int,
-                 sigma_per_step: Optional[float], drift_per_step: float = 0.0) -> float:
-    """Closed-form GBM probability that price closes ABOVE `strike` after `steps`
-    5-minute intervals — the core direction/edge model. The model is just
-    persistence: "is spot above the open, given the volatility still to come?"
-    Returns 0..1.
-    """
-    if not current_price or not strike or current_price <= 0 or strike <= 0:
+    if not spot or not strike or spot <= 0 or strike <= 0:
         return 0.5
-    n = max(1, int(steps))
-    if sigma_per_step is None or sigma_per_step <= 0:
-        return 1.0 if current_price > strike else 0.0
-    mu = (drift_per_step - 0.5 * sigma_per_step ** 2) * n
-    sd = sigma_per_step * math.sqrt(n)
-    # P(S * exp(X) > K) for X ~ N(mu, sd^2)  ->  1 - Phi(z)  ->  0.5 * erfc(z/sqrt2)
-    z = (math.log(strike / current_price) - mu) / sd
-    prob = 0.5 * math.erfc(z / math.sqrt(2))
+    if tau_s <= 0:
+        return 1.0 if spot > strike else 0.0
+    sig = sigma if (sigma is not None and sigma > 0) else 0.000045
+    z = math.log(spot / strike) / (sig * math.sqrt(tau_s))
+    prob = 0.5 * (1.0 + math.erf(z / SQRT2))
     return float(min(1.0, max(0.0, prob)))
 
-
-class ChainlinkTwapTracker:
-    """O(1) incremental 60-second Chainlink TWAP (time-weighted average price) tracker.
-    Used for tracking Polymarket 15m official settlement prices."""
-    def __init__(self, window_seconds: float = 60.0):
-        self.window_ms = window_seconds * 1000.0
-        self.ticks = deque()
-        self.latest_price = None
-
-    def add_tick(self, price: float, ts_ms: Optional[float] = None) -> Optional[float]:
-        if price is None or price <= 0:
-            return self.get_twap(ts_ms)
-        now_ms = ts_ms if ts_ms is not None else (time.time() * 1000.0)
-        self.latest_price = float(price)
-        self.ticks.append((now_ms, self.latest_price))
-        self._prune(now_ms)
-        return self.get_twap(now_ms)
-
-    def _prune(self, now_ms: float):
-        cutoff = now_ms - self.window_ms
-        while len(self.ticks) > 1 and self.ticks[1][0] < cutoff:
-            self.ticks.popleft()
-
-    def get_twap(self, now_ms: Optional[float] = None) -> Optional[float]:
-        if not self.ticks:
-            return self.latest_price
-        cur_ms = now_ms if now_ms is not None else (time.time() * 1000.0)
-        self._prune(cur_ms)
-        if len(self.ticks) == 1:
-            return self.ticks[0][1]
-
-        total_weight = 0.0
-        weighted_sum = 0.0
-        cutoff = cur_ms - self.window_ms
-
-        for i in range(len(self.ticks) - 1):
-            t_start, p = self.ticks[i]
-            t_end, _ = self.ticks[i + 1]
-            effective_start = max(t_start, cutoff)
-            dt = t_end - effective_start
-            if dt > 0:
-                weighted_sum += p * dt
-                total_weight += dt
-
-        last_t, last_p = self.ticks[-1]
-        dt_last = max(0.0, cur_ms - max(last_t, cutoff))
-        if dt_last > 0:
-            weighted_sum += last_p * dt_last
-            total_weight += dt_last
-
-        if total_weight > 0:
-            return weighted_sum / total_weight
-        return self.latest_price or self.ticks[-1][1]

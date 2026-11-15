@@ -1,7 +1,8 @@
 import os
 import json
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Dict
+from typing import List, Dict, Any
+from bot import polybolt
 
 CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config.json"))
 
@@ -17,18 +18,13 @@ class Settings(BaseSettings):
     # The wallet is DERIVED from PRIVATE_KEY (hex key or 12/24-word seed phrase) and
     # auto-detected: deposit-wallet (V2, signature_type 3) first, then legacy proxy /
     # safe — whichever actually holds pUSD. Nothing to pick by hand.
-    CLOB_MAX_SLIPPAGE: float = 0.05  # marketable-limit buffer above the quote (probability units)
+    CLOB_MAX_SLIPPAGE: float = 0.02  # marketable-limit buffer above the quote (probability units)
     EXIT_MAX_RETRIES: int = 3
     CLOB_ALLOW_PARTIAL_FILL: bool = True  # FOK with FAK fallback for thin books
     RELAYER_API_KEY: str = ""        # Polymarket relayer API key (sponsors gasless on-chain setup)
     ALCHEMY_API_KEY: str = ""        # optional: dedicated Polygon RPC for chain reads
 
-    # ── Copy-trader continuous FOK execution ───────────────────────────────────
-    COPY_RETRY_INTERVAL_MS: int = 300
-    COPY_MIN_REMAINING_S: float = 30.0
-
     SYMBOL: str = "BTCUSDT"
-    BINANCE_BASE_URL: str = "https://api.binance.com"
     GAMMA_BASE_URL: str = "https://gamma-api.polymarket.com"
     CLOB_BASE_URL: str = "https://clob.polymarket.com"
 
@@ -39,24 +35,23 @@ class Settings(BaseSettings):
     RISK_TYPE: str = "percent"
     RISK_VALUE: float = 10.0
 
-    # ── Latency-arb entry engine ────────────────────────────────────────────────
-    # Fair probability (fast, from Binance spot) vs Polymarket's implied price.
-    # Enter when EV = fair - ask_price clears EV_THRESHOLD (the book looks stale).
+    # ── POB-main Chainlink EV entry engine ──────────────────────────────────────
     EV_THRESHOLD: float = 0.04          # require >= this expected value per $1 share (after price)
     MIN_PROB_EV: float = 0.55           # don't bet near-coinflips even if EV looks positive
     MIN_BOOK_LIQUIDITY_USD: float = 20.0  # skip if the ask side can't absorb the stake
     MAX_BOOK_AGE_S: float = 3.0
+    MIN_ENTRY_SECOND: int = 0
+    MAX_ENTRY_SECOND: int = 840
+    MIN_SECONDS_LEFT: int = 20
+    MIN_STRIKE_DISTANCE_BP: float = 0.0
+    NET_EV_GATE: bool = False
+    USE_VETOES: bool = True
 
-    # ── Stage 7 (Champion Strategy) Filters ────────────────────────────────────
-    MIN_STRIKE_DISTANCE_BP: float = 6.0     # Min price displacement from open strike (6 bp = 0.06% = ~$60 on BTC)
-    MIN_ENTRY_SECOND: int = 90             # Skip first 90s (Minute 0 noise & wide spread)
-    MAX_ENTRY_SECOND: int = 600            # Stop entry after Minute 10 (avoid buying bloated 85-95c asks)
-    USE_15M_HA: bool = True                # Forbid counter-trend entries against 15m structural HA
-    CIRCUIT_BREAKER_LOSSES: int = 2        # Consecutive losses to trigger circuit breaker pause
-    CIRCUIT_BREAKER_PAUSE_MARKETS: int = 4 # Pause duration in 15m markets (4 markets = 1 hour)
-    PAUSE_MARKETS: int = 4                 # Alias for pause duration in 15m markets
-    MAX_1H_VOL_BP: float = 45.0            # Max 1h ATR volatility ceiling (skip macro spikes > 45 bp)
-    SKIP_HOURS_UTC: List[int] = [18, 23]   # Skip 18:00 (US cash close rebalance) and 23:00 (daily funding roll)
+    FEES_ENABLED: bool = True
+    FEE_RATE: float = 0.07
+
+    # ── PolyBolt (wss://ws-live-v2.polymarket.com/ws) ───────────────────────────
+    PRICE_STREAM: Dict[str, Any] = dict(polybolt.DEFAULTS)
 
     # After a window expires, wait this long for Polymarket to publish its OFFICIAL
     # outcome before falling back to our own close-vs-open comparison. Without this the
@@ -151,24 +146,15 @@ def load_settings():
             if "private_key" in config_data:
                 base_settings.PRIVATE_KEY = normalize_private_key(config_data["private_key"])
 
+            if "relayer" in config_data:
+                rl = config_data["relayer"]
+                if "api_key" in rl: base_settings.RELAYER_API_KEY = rl["api_key"]
+
             if "live" in config_data:
                 live = config_data["live"]
                 if "max_slippage" in live: base_settings.CLOB_MAX_SLIPPAGE = float(live["max_slippage"])
                 if "exit_max_retries" in live: base_settings.EXIT_MAX_RETRIES = int(live["exit_max_retries"])
                 if "allow_partial_fill" in live: base_settings.CLOB_ALLOW_PARTIAL_FILL = bool(live["allow_partial_fill"])
-                if "copy_trader" in live:
-                    ct = live["copy_trader"]
-                    if "retry_interval_ms" in ct: base_settings.COPY_RETRY_INTERVAL_MS = int(ct["retry_interval_ms"])
-                    if "min_remaining_seconds" in ct: base_settings.COPY_MIN_REMAINING_S = float(ct["min_remaining_seconds"])
-
-            if "relayer" in config_data:
-                rl = config_data["relayer"]
-                if "api_key" in rl: base_settings.RELAYER_API_KEY = rl["api_key"]
-
-            if "copy_trader" in config_data and "copy_trader" not in config_data.get("live", {}):
-                ct = config_data["copy_trader"]
-                if "retry_interval_ms" in ct: base_settings.COPY_RETRY_INTERVAL_MS = int(ct["retry_interval_ms"])
-                if "min_remaining_seconds" in ct: base_settings.COPY_MIN_REMAINING_S = float(ct["min_remaining_seconds"])
 
             if "polymarket" in config_data:
                 poly = config_data["polymarket"]
@@ -184,35 +170,44 @@ def load_settings():
             if "trading" in config_data:
                 trading = config_data["trading"]
                 if "symbol" in trading: base_settings.SYMBOL = trading["symbol"]
-                if "binance_base_url" in trading: base_settings.BINANCE_BASE_URL = trading["binance_base_url"]
                 if "candle_window_minutes" in trading: base_settings.CANDLE_WINDOW_MINUTES = trading["candle_window_minutes"]
                 if "poll_interval_ms" in trading: base_settings.POLL_INTERVAL_MS = trading["poll_interval_ms"]
                 if "risk_type" in trading: base_settings.RISK_TYPE = trading["risk_type"]
                 if "risk_value" in trading: base_settings.RISK_VALUE = trading["risk_value"]
 
+            if "ev" in config_data:
+                ev = config_data["ev"]
+                if "ev_threshold" in ev: base_settings.EV_THRESHOLD = float(ev["ev_threshold"])
+                if "min_prob" in ev: base_settings.MIN_PROB_EV = float(ev["min_prob"])
+                if "min_book_liquidity_usd" in ev: base_settings.MIN_BOOK_LIQUIDITY_USD = float(ev["min_book_liquidity_usd"])
+                if "max_book_age_s" in ev: base_settings.MAX_BOOK_AGE_S = float(ev["max_book_age_s"])
+                if "min_entry_second" in ev: base_settings.MIN_ENTRY_SECOND = int(ev["min_entry_second"])
+                if "max_entry_second" in ev: base_settings.MAX_ENTRY_SECOND = int(ev["max_entry_second"])
+                if "min_seconds_left" in ev: base_settings.MIN_SECONDS_LEFT = int(ev["min_seconds_left"])
+                if "min_strike_distance_bp" in ev: base_settings.MIN_STRIKE_DISTANCE_BP = float(ev["min_strike_distance_bp"])
+                if "net_ev_gate" in ev: base_settings.NET_EV_GATE = bool(ev["net_ev_gate"])
+                if "use_vetoes" in ev: base_settings.USE_VETOES = bool(ev["use_vetoes"])
+
             if "strategy" in config_data:
                 strat = config_data["strategy"]
                 if "ev_threshold" in strat: base_settings.EV_THRESHOLD = float(strat["ev_threshold"])
                 if "min_prob" in strat: base_settings.MIN_PROB_EV = float(strat["min_prob"])
-                if "min_strike_distance_bp" in strat: base_settings.MIN_STRIKE_DISTANCE_BP = float(strat["min_strike_distance_bp"])
+                if "min_book_liquidity_usd" in strat: base_settings.MIN_BOOK_LIQUIDITY_USD = float(strat["min_book_liquidity_usd"])
                 if "min_entry_second" in strat: base_settings.MIN_ENTRY_SECOND = int(strat["min_entry_second"])
                 if "max_entry_second" in strat: base_settings.MAX_ENTRY_SECOND = int(strat["max_entry_second"])
-                if "circuit_breaker_losses" in strat: base_settings.CIRCUIT_BREAKER_LOSSES = int(strat["circuit_breaker_losses"])
-                if "pause_markets" in strat:
-                    base_settings.PAUSE_MARKETS = int(strat["pause_markets"])
-                    base_settings.CIRCUIT_BREAKER_PAUSE_MARKETS = int(strat["pause_markets"])
-                if "max_1h_vol_bp" in strat: base_settings.MAX_1H_VOL_BP = float(strat["max_1h_vol_bp"])
-                if "skip_hours" in strat and isinstance(strat["skip_hours"], list):
-                    base_settings.SKIP_HOURS_UTC = [int(h) for h in strat["skip_hours"]]
-                if "min_book_liquidity_usd" in strat: base_settings.MIN_BOOK_LIQUIDITY_USD = float(strat["min_book_liquidity_usd"])
-                if "max_book_age_s" in strat: base_settings.MAX_BOOK_AGE_S = float(strat["max_book_age_s"])
+                if "min_seconds_left" in strat: base_settings.MIN_SECONDS_LEFT = int(strat["min_seconds_left"])
+                if "min_strike_distance_bp" in strat: base_settings.MIN_STRIKE_DISTANCE_BP = float(strat["min_strike_distance_bp"])
+                if "net_ev_gate" in strat: base_settings.NET_EV_GATE = bool(strat["net_ev_gate"])
 
-            if "ev" in config_data:
-                ev = config_data["ev"]
-                if "ev_threshold" in ev and "strategy" not in config_data: base_settings.EV_THRESHOLD = float(ev["ev_threshold"])
-                if "min_prob" in ev and "strategy" not in config_data: base_settings.MIN_PROB_EV = float(ev["min_prob"])
-                if "min_book_liquidity_usd" in ev and "strategy" not in config_data: base_settings.MIN_BOOK_LIQUIDITY_USD = float(ev["min_book_liquidity_usd"])
-                if "max_book_age_s" in ev and "strategy" not in config_data: base_settings.MAX_BOOK_AGE_S = float(ev["max_book_age_s"])
+            if "use_vetoes" in config_data:
+                base_settings.USE_VETOES = bool(config_data["use_vetoes"])
+
+            if "fees" in config_data:
+                fees = config_data["fees"]
+                if "enabled" in fees: base_settings.FEES_ENABLED = bool(fees["enabled"])
+                if "fee_rate" in fees: base_settings.FEE_RATE = float(fees["fee_rate"])
+
+            base_settings.PRICE_STREAM = polybolt.merged(config_data.get("price_stream"))
 
             if "settlement" in config_data:
                 st = config_data["settlement"]

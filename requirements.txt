@@ -1,4 +1,5 @@
-# Verified working set (Python 3.12). Pinned to the exact versions the bot was tested against.
+# Verified working set (Python 3.12). Pinned to the exact versions the bot was
+# tested against — see documentation.md.
 #
 # REQUIRES PYTHON >= 3.12: polymarket-apis declares Requires-Python >=3.12, so on
 # 3.11 pip reports "from versions: none" and the install fails. The Dockerfile uses
@@ -25,5 +26,3 @@ aiofiles==25.1.0
 gunicorn==23.0.0
 polymarket-apis==2.3.0
 eth-account==0.13.7
-orjson>=3.10.0
-coincurve>=20.0.0
